@@ -1,0 +1,14 @@
+BAND,NAME,WAVELENGTH_nm,BANDWIDTH_nm,RESOLUTION_m,Notes
+1,Coastal aerosol,443,20,60,"Narrow bandwidth, Low spatial resolution"
+2,Blue,490,65,10,"VIS has high energy, good spatial resolution"
+3,Green,560,35,10,"VIS has high energy, good spatial resolution"
+4,Red,665,30,10,"VIS has high energy, good spatial resolution"
+5,Vegetation Red Edge 1,705,15,20,"Narrow band, moderate spatial resolution"
+6,Vegetation Red Edge 2,740,15,20,"Narrow band, moderate spatial resolution"
+7,Vegetation Red Edge 3,783,20,20,"Narrow band, moderate spatial resolution"
+8,NIR,842,115,10,"Lower energy, wide band, good spatial resolution"
+8A,Narrow NIR,865,20,20,"Narrower band, lower spatial resolution"
+9,Water vapour,940,20,60,
+10,SWIR - Cirrus,1375,20,60,
+11,SWIR 2,1610,90,20,
+12,SWIR 3,2190,180,20,Wide band to get reasonable spatial resolution

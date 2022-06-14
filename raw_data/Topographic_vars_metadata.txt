@@ -1,0 +1,16 @@
+Metadata for topographic variables in NM Decid Mapping Project
+For more details see Assal et al. 2018 - J. of Biogeography
+
+
+Elevation (meters) - derived from a 10 m elevation model from the National map
+Slope (radians) - Derived from elevation data set  
+North exposure (N.ness) - Cosine transformation of aspect
+East exposure (E.ness) - Sine transformation of aspect
+Heat load index (HLI) - Potential direct incident radiation (McCune & Keon, 2002; equation 3) (this equation considers aspect * slope; e.g. steeper SW facing slopes receive more direct radiation than gentle SW facing slopes)
+Topographic position index (TPI) - A measure of slope position and landform type with respect to adjacent grid cells (De Reu et al., 2013)—negative TPI values indicate valley bottoms; positive values indicate ridgetops
+Topographic ruggedness index (TRI) - A measure of topographic heterogeneity with respect to adjacent cells (Riley, DeGloria, & Elliot, 1999)—low values indicate level topography; high values indicate rugged topography
+
+
+
+
+

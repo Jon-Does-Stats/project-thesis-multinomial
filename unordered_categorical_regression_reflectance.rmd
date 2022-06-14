@@ -1,0 +1,4635 @@
+---
+title: "Unordered Categorical Regression - Species\Reflectance Model"
+author: "Jonathan Schierbaum"
+date: "SUMMER 2021 - SPRING 2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+
+packages <- c("knitr", "dplyr", "coda", 
+              "nimble", "sf", "spatstat", 
+              "ggplot2", "maptools", "hdrcde", 
+              "RColorBrewer", "ggtern", "ggh4x", 
+              "ggmap", "devtools", "ggsn", 
+              "mgcv")
+
+missing <- packages[!(packages %in% installed.packages())]
+
+if(length(missing) > 0) install.packages(missing)
+
+invisible(suppressMessages(lapply(packages, library, character.only = TRUE)))
+
+rm(packages, missing)
+```
+
+## 0) Preload data
+```{r load_data}
+setwd("~/GitHub/spatial_multinomial")
+
+
+fp_raw_data <- "~/GitHub/project-spatial-poisson-crime/raw_data/"
+
+fp_data_obj <- "~/GitHub/project-spatial-poisson-crime/data_objs/"
+
+fp_figures <- "~/GitHub/project-spatial-poisson-crime/figures/"
+
+############## LOAD DATA FOR ANALYSIS ###################
+load(file.path(paste0(fp_data_obj, "NM_aggregated_data.Rdata")))
+load(file.path(paste0(fp_data_obj, "posterior_params_thesis.Rdata")))
+load(file.path(paste0(fp_data_obj, "config_file_thesis.Rdata")))
+load(file.path(paste0(fp_data_obj, "study_area_bounds.Rdata")))
+
+############# LOAD RECENT MCMC SAMPLES ##################
+load(file.path(paste0(fp_data_obj, "fit.Rdata")))   ### SAMPLE 1, 20K
+
+############## OUTLYING VALUES WE NEED TO CHECK #########
+outliers <- which(agg_band_data$Reflectance > 1)
+
+suspect <-which(agg_band_data$Id == 15 & agg_band_data$day_of_year == 314 | agg_band_data$Id == 16 & agg_band_data$day_of_year == 314)
+
+suspect_rows <- agg_band_data[suspect, ]
+
+outlying_rows <- agg_band_data[outliers, ]
+
+############# CONFIRMED WITH COLLABORATORS - REMOVE OUTLYING VALUES
+agg_band_data <- agg_band_data[-suspect, ]
+```
+## 1) User Functions
+
+### 1.1) Modeling Functions
+```{r user_functions_mod}
+# covariance for a Gaussian process using an exponential covariance function.
+## THE LARGER THE DECAY PARAMETER, THE WEAKER CORRELATION BETWEEN SITES.
+expcov <- nimbleFunction(     
+  run = function(distance.matrix = double(2), spatial.decay.phi = double(0)) {
+    returnType(double(2))
+    n <- dim(distance.matrix)[1]
+    result <- matrix(nrow = n, ncol = n, init = FALSE)
+    for(i in 1:n)
+      for(j in 1:n)
+        result[i, j] <- exp(-distance.matrix[i, j] * spatial.decay.phi)
+    return(result)
+  })
+
+
+# covariance for a Gaussian process using an exponential covariance function.
+## PROVIDE SIGMA
+## CHANGABLE SIGMA, DECAY PARAMETER DIVIDES
+## THE LARGER THE DECAY PARAMETER, THE STRONGER CORRELATION BETWEEN SITES.
+expcov2 <- nimbleFunction(     
+  run = function(distance.matrix = double(2), spatial.decay.rho = double(0), 
+                 sigma = double(0)) {returnType(double(2))
+    
+    n <- dim(distance.matrix)[1]
+    result <- matrix(nrow = n, ncol = n, init = FALSE)
+    sigma.sq <- sigma * sigma
+    for(i in 1:n)
+      for(j in 1:n)
+        result[i, j] <- sigma.sq * exp(-distance.matrix[i, j] / spatial.decay.rho)
+    return(result)
+  })
+
+
+# covariance for a Gaussian process using an exponential covariance function.
+
+## PROVIDE SIGMA SQ
+## CHANGABLE SIGMA, DECAY PARAMETER DIVIDES
+## THE LARGER THE DECAY PARAMETER, THE STRONGER CORRELATION BETWEEN SITES.
+expcov3 <- nimbleFunction(     
+  run = function(distance.matrix = double(2), spatial.decay.rho = double(0), 
+                 sigma.sq = double(0)) {returnType(double(2))
+    
+    n <- dim(distance.matrix)[1]
+    result <- matrix(nrow = n, ncol = n, init = FALSE)
+    for(i in 1:n)
+      for(j in 1:n)
+        result[i, j] <- sigma.sq * exp(-distance.matrix[i, j] / spatial.decay.rho)
+    return(result)
+  })
+
+
+# user-defined Dirichlet-multinomial distribution
+ddirchmulti <- nimbleFunction(
+run = function(x = double(1), alpha = double(1), size = double(0), log = integer(0, default = 0)) {
+returnType(double(0))
+logProb <- lgamma(size + 1) - sum(lgamma(x + 1)) + lgamma(sum(alpha)) - sum(lgamma(alpha)) + sum(lgamma(alpha + x)) - lgamma(sum(alpha) + size)
+if(log) return(logProb)
+else return(exp(logProb))
+})
+
+
+# user-defined Dirichlet-multinomial distribution
+rdirchmulti <- nimbleFunction(
+run = function(n = integer(0), alpha = double(1), size = double(0)) {
+returnType(double(1))
+if(n != 1) print("rdirchmulti only allows n = 1; using n = 1.")
+p <- rdirch(1, alpha)
+return(rmulti(1, size = size, prob = p))
+})
+
+
+# simulate Dirichlet samples with 4 groups
+dirch_sim_4grp <- function(n, alpha1, alpha2, alpha3, alpha4) {
+
+output <- matrix(NA, nrow = n, ncol = 4)    
+for (i in 1:n) {
+  
+output[i, ]<- rdirch(alpha = c(alpha1, alpha2, alpha3, alpha4))
+
+}
+  return(output)
+}
+
+
+# simulate Dirichlet samples with 4 groups
+dirch_sim_3grp <- function(n, alpha1, alpha2, alpha3) {
+
+output <- matrix(NA, nrow = n, ncol = 3)    
+for (i in 1:n) {
+  
+output[i, ]<- rdirch(alpha = c(alpha1, alpha2, alpha3))
+
+}
+  return(output)
+}
+
+
+# simulate multivariate normal
+rmvn <- function(n, mu = 0, COV = matrix(1)) {
+  p <- length(mu)
+  if (any(is.na(match(dim(COV), p)))) 
+        stop("Dimension problem!")
+  D <- chol(COV)
+  t(matrix(rnorm(n * p), ncol = p) %*% D + rep(mu, rep(n, p)))
+}
+
+
+# convert nimble response output to single vector
+vectresponse_4cat <- function(y) {apply(y, 1, function (x) sum(x * c(1, 2, 3, 4)))}
+
+
+# convert single vector to nimble response input
+assign_y <- nimbleFunction(     
+  run = function(alpha.vec = double(1), n = integer(), K = integer()) {
+    returnType(integer(1))
+    
+    y.vec <- integer(K)
+    
+    y.vec[which(alpha.vec[1:K]==max(alpha.vec[1:K]))] <- 1
+      
+   return(y.vec)})
+
+
+split_vec <- function(x,n) split(x, cut(seq_along(x), n, labels = FALSE)) 
+
+```
+
+
+### 1.2) Analysis/Visualization Functions
+
+#### 1.2.1) Posterior Parameters From Array
+```{r user_functions_viz_1}
+extract_params <- function(mcmc_output){
+  params_vector <- numeric(ncol(mcmc_output))
+  col_names <- colnames(mcmc_output)
+  names(params_vector) <- col_names
+  
+  for (i in 1:ncol(mcmc_output)) {
+    tryCatch({
+      hold <- hdr(mcmc_output[, i])
+      params_vector[i] <- hold$mode}, error = function(c){params_vector[i] <- NA})
+    }  
+  return(params_vector)    
+}
+
+posterior_params <- function(mcmc_output, mcmc_config, n.sites = 60, n.predictors = 8, n.bands = 10, n.categories = 3, n.basis.refl, n.basis.spat){
+  
+  params_vector <- extract_params(mcmc_output)
+  
+  msg <- utils::capture.output(hold <- mcmc_config$printMonitors(), type="output")
+  monitor <- strsplit(msg, split = "[:,]")
+  monitor <- unlist(monitor)
+  monitor <- monitor[2:length(monitor)]
+  monitor <- trimws(monitor, "b")
+  
+  prefix <- c("site", "pred", "grp", "basis")
+  
+  dimlist1 <- list(paste(prefix[2], 1:n.predictors, sep = "_"), paste(prefix[3], 1:n.categories,  sep = "_"))
+  dimlist2 <- list(paste(prefix[1], 1:n.sites, sep = "_"), paste(prefix[3], 1:n.categories, sep = "_"))
+  dimlist3 <- list(paste(prefix[1], 1:n.sites, sep = "_"))
+  dimlist5 <- list(paste(prefix[4], 1:n.basis.refl, sep = "_"), paste(prefix[3], 1:n.categories,  sep = "_"))
+  dimlist6 <- list(paste(prefix[4], 1:n.basis.spat, sep = "_"), paste(prefix[3], 1:n.categories,  sep = "_"))
+  dimlist7 <- list(paste(prefix[1], 1:n.sites, sep = "_"), paste(prefix[3], 1:n.categories,  sep = "_"))
+  
+                   
+  parameter_modes <- list()
+   
+  for (i in 1:length(monitor)){
+    if (monitor[i] == "alpha"){
+      alpha_matrix <- matrix(params_vector[grep(paste0(monitor[i], "\\["), names(params_vector))], nrow = n.sites, ncol = n.categories, dimnames = dimlist2)  
+     
+      parameter_modes[[i]] = alpha_matrix
+    }
+    
+    if (monitor[i] == "beta"){
+      beta_matrix <- matrix(params_vector[grep(paste0(monitor[i], "\\["), names(params_vector))], nrow = n.predictors, ncol = n.categories, dimnames = dimlist1)
+     
+      parameter_modes[[i]] = beta_matrix
+    }
+   
+    if (monitor[i] == "gamma") {
+      gamma_matrix <- matrix(params_vector[grep(paste0(monitor[i], "\\["), names(params_vector))],  nrow = n.basis.refl, ncol = n.categories, dimnames = dimlist6)
+  
+      parameter_modes[[i]] = gamma_matrix
+    }
+  
+    if (monitor[i] == "phi") {
+      phi_matrix <- matrix(params_vector[grep(paste0(monitor[i], "\\["), names(params_vector))],  nrow = n.basis.spat, ncol = n.categories, dimnames = dimlist5)
+  
+      parameter_modes[[i]] = phi_matrix
+    }
+      
+    if (monitor[i] == "prob") {
+      prob_matrix <- matrix(params_vector[grep(paste0(monitor[i], "\\["), names(params_vector))], nrow = n.sites, ncol = n.categories, dimnames = dimlist2)
+  
+      parameter_modes[[i]] = prob_matrix  
+    }
+  
+    if (monitor[i] == "spatial_process") {
+      spatial_matrix <- matrix(params_vector[grep(paste0(monitor[i], "\\["), names(params_vector))], nrow = n.sites, ncol = n.categories, dimnames = dimlist7)
+  
+      parameter_modes[[i]] = spatial_matrix   
+      }
+  
+    if (monitor[i] == "sigma") {
+      sigma <- params_vector[grep(paste0(monitor[i]), names(params_vector))]
+  
+      parameter_modes[[i]] = sigma    
+    } 
+    
+    if (monitor[i] == "L2group"){
+      L2group_matrix <- matrix(params_vector[grep(paste0(monitor[i], "\\["), names(params_vector))], nrow = n.predictors, ncol = n.categories, dimnames = dimlist1)
+     
+      parameter_modes[[i]] = L2group_matrix
+    }
+    
+    if (monitor[i] == "L2effect"){
+      L2effect_matrix <- matrix(params_vector[grep(paste0(monitor[i], "\\["), names(params_vector))], nrow = n.predictors, ncol = n.categories, dimnames = dimlist1)
+     
+      parameter_modes[[i]] = L2effect_matrix
+    }
+   
+    if (monitor[i] == "L1group") {
+      L1group_matrix <- matrix(params_vector[grep(paste0(monitor[i], "\\["), names(params_vector))], nrow = n.predictors, ncol = n.categories, dimnames = dimlist1)
+  
+      parameter_modes[[i]] =  L1group_matrix
+    }
+  
+    if (monitor[i] == "L1effect") {
+      L1effect_matrix <-matrix(params_vector[grep(paste0(monitor[i], "\\["), names(params_vector))], nrow = n.predictors, ncol = n.categories, dimnames = dimlist1)
+  
+      parameter_modes[[i]] = L1effect_matrix
+    }
+    
+    if (monitor[i] == "wgroup") {
+      wgroup_matrix <- matrix(params_vector[grep(paste0(monitor[i], "\\["), names(params_vector))], nrow = n.predictors, ncol = n.categories, dimnames = dimlist1)
+  
+      parameter_modes[[i]] = wgroup_matrix
+    }
+  
+    if (monitor[i] == "weffect") {
+      weffect_matrix <-  matrix(params_vector[grep(paste0(monitor[i], "\\["), names(params_vector))], nrow = n.predictors, ncol = n.categories, dimnames = dimlist1)
+  
+      parameter_modes[[i]] = weffect_matrix
+    }
+  }
+  names(parameter_modes) <- monitor
+  return(parameter_modes)
+}
+
+```
+
+#### 1.2.2) Array Builder
+```{r user_functions_viz_2}
+array_builder <- function(mcmc_output, mcmc_config, n.sites = 60, n.predictors = 8, n.bands = 10, n.categories = 3, n.basis.refl = 35, n.basis.spat = 35) {
+    
+  iter <- dim(mcmc_output)[1]  
+  
+  name <- deparse(substitute(mcmc_output))
+  
+  msg <- utils::capture.output(hold <- mcmc_config$printMonitors(), type="output")
+  
+  monitor <- strsplit(msg, split = "[:,]")
+  monitor <- unlist(monitor)
+  monitor <- monitor[2:length(monitor)]
+  monitor <- trimws(monitor, "b")
+
+  search.mon1 <- paste0(monitor[1], "\\[")
+  search.mon2 <- paste0(monitor[2], "\\[")
+  search.mon3 <- paste0(monitor[3], "\\[")
+  search.mon4 <- paste0(monitor[4], "\\[")
+  search.mon5 <- paste0(monitor[5], "\\[")
+  search.mon6 <- paste0(monitor[6], "\\[")
+  search.mon7 <- paste0(monitor[7])
+
+  check.alpha    <- length(grep(search.mon1, colnames(mcmc_output)))
+  check.beta     <- length(grep(search.mon2, colnames(mcmc_output)))
+  check.gamma    <- length(grep(search.mon3, colnames(mcmc_output)))
+  check.phi      <- length(grep(search.mon4, colnames(mcmc_output)))
+  check.prob     <- length(grep(search.mon5, colnames(mcmc_output)))
+  check.spatial  <- length(grep(search.mon6, colnames(mcmc_output)))
+  check.sigma    <- length(grep(search.mon7, colnames(mcmc_output)))
+  
+  check.wgroup   <- length(grep("wgroup\\[", colnames(mcmc_output)))
+  check.L2group  <- length(grep("L2group\\[", colnames(mcmc_output)))
+  check.L1group  <- length(grep("L1group\\[", colnames(mcmc_output)))
+  check.weffect  <- length(grep("weffect\\[", colnames(mcmc_output)))
+  check.L2effect <- length(grep("L2effect\\[", colnames(mcmc_output)))
+  check.L1effect <- length(grep("L1effect\\[", colnames(mcmc_output)))
+  check.spat.rho      <- length(grep("spatial.decay.rho", colnames(mcmc_output)))
+  check.spat.phi      <- length(grep("spatial.decay.phi", colnames(mcmc_output)))                      
+  
+  prefix <- c("iter", "site", "pred", "grp", "basis")
+  
+  dimlist1 <- list(paste(prefix[1], 1:iter, sep = "_"), paste(prefix[3], 1:n.predictors, sep = "_"), paste(prefix[4], 1:n.categories,  sep = "_"))
+  dimlist2 <- list(paste(prefix[1], 1:iter, sep = "_"), paste(prefix[2], 1:n.sites, sep = "_"), paste(prefix[4], 1:n.categories, sep = "_"))
+  dimlist3 <- list(paste(prefix[1], 1:iter, sep = "_"), paste(prefix[2], 1:n.sites, sep = "_"))
+  dimlist4 <- list(paste(prefix[1], 1:iter, sep = "_"))
+  dimlist5 <- list(paste(prefix[1], 1:iter, sep = "_"), paste(prefix[5], 1:n.basis.refl, sep = "_"), paste(prefix[4], 1:n.categories,  sep = "_"))
+  dimlist6 <- list(paste(prefix[1], 1:iter, sep = "_"), paste(prefix[5], 1:n.basis.spat, sep = "_"), paste(prefix[4], 1:n.categories,  sep = "_"))
+  dimlist7 <- list(paste(prefix[1], 1:iter, sep = "_"), paste(prefix[2], 1:n.sites, sep = "_"), paste(prefix[4], 1:n.categories,  sep = "_"))
+  
+                    
+  
+  if (check.alpha > 0) {
+    assign(paste0(name, ".", monitor[1]), array(mcmc_output[, grep(search.mon1, colnames(mcmc_output))], dim = c(iter, n.sites, n.categories), dimnames = dimlist2), envir = .GlobalEnv)
+  }
+  
+  if (check.beta  > 0) {  
+    assign(paste0(name, ".", monitor[2]), array(mcmc_output[, grep(search.mon2, colnames(mcmc_output))], dim = c(iter, n.predictors, n.categories), dimnames = dimlist1), envir = .GlobalEnv)
+  }
+  
+  if (check.gamma > 0) {
+    assign(paste0(name, ".", monitor[3]), array(mcmc_output[, grep(search.mon3, colnames(mcmc_output))], dim = c(iter, n.basis.refl, n.categories), dimnames = dimlist6), envir = .GlobalEnv)  
+  }
+  
+  if (check.phi > 0) {
+    assign(paste0(name, ".", monitor[4]), array(mcmc_output[, grep(search.mon4, colnames(mcmc_output))], dim = c(iter, n.basis.spat, n.categories), dimnames = dimlist5), envir = .GlobalEnv)  
+  } 
+  
+  if (check.prob > 0) {
+    assign(paste0(name, ".", monitor[5]), array(mcmc_output[, grep(search.mon5, colnames(mcmc_output))], dim = c(iter, n.sites, n.categories), dimnames = dimlist2), envir = .GlobalEnv)
+  }
+  
+  if (check.spatial > 0) {
+    assign(paste0(name, ".", monitor[6]), array(mcmc_output[, grep(search.mon6, colnames(mcmc_output))], dim = c(iter, n.sites, n.categories), dimnames = dimlist7), envir = .GlobalEnv)
+  }
+  
+  if (check.sigma > 0) {
+    assign(paste0(name, ".", monitor[7]), array(mcmc_output[, grep(search.mon7, colnames(mcmc_output))], dim = c(iter), dimnames = dimlist4), envir = .GlobalEnv)
+  }
+  
+
+  if (check.wgroup > 0) {
+    assign(paste0(name, ".wgroup"), array(mcmc_output[, grep("wgroup\\[", colnames(mcmc_output))], dim = c(iter, n.predictors, n.categories), dimnames = dimlist1), envir = .GlobalEnv)
+  }
+  
+  if (check.L2group > 0) {
+    assign(paste0(name, ".L2group"), array(mcmc_output[, grep("L2group\\[", colnames(mcmc_output))], dim = c(iter, n.predictors, n.categories), dimnames = dimlist1), envir = .GlobalEnv)
+  }
+  
+  if (check.L1group > 0) {
+    assign(paste0(name, ".L1group"), array(mcmc_output[, grep("L1group\\[", colnames(mcmc_output))], dim = c(iter, n.predictors, n.categories), dimnames = dimlist1), envir = .GlobalEnv)
+  }
+  
+  if (check.weffect > 0) { 
+    assign(paste0(name, ".weffect"), array(mcmc_output[, grep("weffect\\[", colnames(mcmc_output))], dim = c(iter, n.predictors, n.categories), dimnames = dimlist1), envir = .GlobalEnv)
+  }
+  
+  if (check.L2effect > 0) {
+    assign(paste0(name, ".L2effect"), array(mcmc_output[, grep("L2effect\\[", colnames(mcmc_output))], dim = c(iter, n.predictors, n.categories), dimnames = dimlist1), envir = .GlobalEnv)
+  }
+  
+  if (check.L1effect > 0) {
+    assign(paste0(name, ".L1effect"), array(mcmc_output[, grep("L1effect\\[", colnames(mcmc_output))], dim = c(iter, n.predictors, n.categories), dimnames = dimlist1), envir = .GlobalEnv)
+  }
+  
+  if (check.spat.rho > 0) {
+    assign(paste0(name, ".decay.rho"), array(mcmc_output[, grep("spatial.decay.rho", colnames(mcmc_output))], dim = c(iter), dimnames = dimlist4), envir = .GlobalEnv)
+  }
+  
+  if (check.spat.phi > 0) {
+    assign(paste0(name, ".decay.phi"), array(mcmc_output[, grep("spatial.decay.phi", colnames(mcmc_output))], dim = c(iter), dimnames = dimlist4), envir = .GlobalEnv)
+  }
+  
+  print("DONE! Objects saved in Global Env.")
+}
+```
+
+#### 1.2.3) Tail Correlation Plots
+```{r user_functions_viz_3}
+tail_plots <- function(mcmc_output_name, 
+                       mcmc_config, 
+                       observation_locations, 
+                       n.sites, 
+                       n.basis.refl, 
+                       n.basis.spat, 
+                       n.categories,
+                       near.dist = 0.02,
+                       far.dist = 0.15){
+  
+  target.sample <- mcmc_output_name
+  
+  msg <- utils::capture.output(mcmc_config$printMonitors(), type="output")
+  
+  monitor <- strsplit(msg, split = "[:,]")
+  monitor <- unlist(monitor)
+  monitor <- monitor[2:length(monitor)]
+  monitor <- trimws(monitor, "b")
+  
+  dist.matrix <- as.matrix(dist(observation_locations))
+  dist.matrix[dist.matrix == 0] <- NA
+  
+  median.dist <- median(dist.matrix, na.rm = T)
+  dist.range <- far.dist - near.dist
+  
+  center  <- sample(1:n.sites, 1)
+  near <- which(dist.matrix[center, ] < near.dist)
+  far  <- which(dist.matrix[center, ] > far.dist)
+  med  <- which(dist.matrix[center, ] > 0.3*dist.range & dist.matrix[center, ] < 0.7*dist.range)
+  
+  while (length(far) < 2){   
+    far.dist <- far.dist - (0.05 * far.dist)
+    far  <- as.vector(which(dist.matrix[center, ] > far.dist))}
+  
+  while (length(near) < 2){
+    near.dist <- far.dist + (0.05 * near.dist)
+    near  <-as.vector(which(dist.matrix[center, ] < near.dist))}
+  
+  while (length(med) < 2){
+    dist.range <- dist.range + (0.1 * dist.range)
+    med  <- as.vector(which(dist.matrix[center, ] > 0.3*dist.range & dist.matrix[center, ] < 0.7*dist.range))}
+  
+  for(i in 1:(length(monitor))) {
+    target.plot <- paste(target.sample, monitor[i], sep = ".")
+    print(paste0("Working on plots for ", target.plot))
+    
+    eval(call("<-", "interest", as.name(target.plot)))
+    
+    name  <- monitor[i]
+    dims  <- dim(interest)
+    begin <- dim(interest)[1] - 1999
+    end   <- dim(interest)[1]
+    
+    if (length(dims) == 3) {
+      
+      if (dims[2] == n.sites) {
+          near.indices <- sample(near, 2)
+          tail <- as.data.frame(interest[begin:end, as.vector(c(center,near.indices)),])
+          
+          print(ggpairs(tail,
+                        title = paste("NEAR correlation: last 2,000 iterations of ", 
+                                      monitor[i]),
+                        progress = F))
+          
+          far.indices <- sample(far, 2)
+          tail <- as.data.frame(interest[begin:end, as.vector(c(center,far.indices)),])
+          
+          print(ggpairs(tail,
+                        title = paste("FAR correlation: last 2,000 iterations of ", 
+                                      monitor[i]),
+                        progress = F))
+          
+          med.indices <- sample(med, 2)
+          tail <- as.data.frame(interest[begin:end, as.vector(c(center,med.indices)),])
+          
+          print(ggpairs(tail,
+                        title = paste("MED correlation: last 2,000 iterations of ", 
+                                      monitor[i]),
+                        progress = F))
+          
+        }      
+        
+      if (dims[2] == n.predictors) {
+        tail1 <- as.data.frame(interest[begin:end, 1:(n.predictors/2),])
+        tail2 <- as.data.frame(interest[begin:end,(n.predictors/2 + 1):n.predictors,])
+        
+        print(ggpairs(tail1,
+                      title = paste("correlation: last 2,000 iterations of ", 
+                                    monitor[i],"1 of 2"),
+                      progress = F))
+        
+        print(ggpairs(tail2,
+                      title = paste("correlation: last 2,000 iterations of ", 
+                                    monitor[i],"2 of 2"),
+                      progress = F))
+        }
+      
+      if (dims[2] == n.basis.refl) {
+        choose.category <- sample(1:n.categories, size = 1)
+        basis.indices <- split_vec(1:n.basis.refl, n = 5)
+      
+        tail1 <- as.data.frame(interest[begin:end, basis.indices[[1]], choose.category])
+        tail2 <- as.data.frame(interest[begin:end, basis.indices[[2]], choose.category])
+        tail3 <- as.data.frame(interest[begin:end, basis.indices[[3]], choose.category])
+        tail4 <- as.data.frame(interest[begin:end, basis.indices[[4]], choose.category])
+        tail5 <- as.data.frame(interest[begin:end, basis.indices[[5]], choose.category])
+        tail6 <- as.data.frame(interest[begin:end, sample(1:n.basis.refl, size = 2), ])
+        
+        
+        print(ggpairs(tail1,
+                      title = paste("within group correlation: last 2,000 iterations of", monitor[i], "(1 of 5)"),
+                      progress = F))
+        
+        print(ggpairs(tail2,
+                      title = paste("within group correlation: last 2,000 iterations of", monitor[i], "(2 of 5)"),
+                      progress = F))
+        
+        print(ggpairs(tail3,
+                      title = paste("within group correlation: last 2,000 iterations of", monitor[i], "(3 of 5)"),
+                      progress = F))
+        
+        print(ggpairs(tail4,
+                      title = paste("within group correlation: last 2,000 iterations of", monitor[i], "(4 of 5)"),
+                      progress = F))
+        
+        print(ggpairs(tail5,
+                      title = paste("within group correlation: last 2,000 iterations of", monitor[i], "(5 of 5)"),
+                      progress = F))
+        
+        
+        print(ggpairs(tail6,
+                      title = paste("within basis correlation: last 2,000 iterations of", monitor[i]),
+                      progress = F))}
+      
+      if (dims[2] == n.basis.spat) {
+        choose.category <- sample(1:n.categories, size = 1)
+        basis.indices <- split_vec(1:n.basis.spat, n = 5)
+        
+        tail1 <- as.data.frame(interest[begin:end, c(basis.indices[[1]],basis.indices[[2]]), choose.category])
+        tail2 <- as.data.frame(interest[begin:end,c(basis.indices[[3]],basis.indices[[4]]), choose.category])
+        tail3 <- as.data.frame(interest[begin:end,basis.indices[[5]], choose.category])
+        tail4 <- as.data.frame(interest[begin:end, sample(1:n.basis.spat, size = 2), ])
+        
+        print(ggpairs(tail1,
+                      title = paste("within group correlation: last 2,000 iterations of", monitor[i],"(1 of 3)"),
+                      progress = F))
+        
+        print(ggpairs(tail2,
+                      title = paste("within group correlation: last 2,000 iterations of", monitor[i], "(2 of 3)"),
+                      progress = F))
+        
+        print(ggpairs(tail3,
+                      title = paste("within group correlation: last 2,000 iterations of", monitor[i], "(3 of 3)"),
+                      progress = F))
+        
+        print(ggpairs(tail4,
+                      title = paste("within basis correlation: last 2,000 iterations of", monitor[i]),
+                      progress = F))}
+    }
+    
+    else { 
+      tail <- as.data.frame(interest[begin:end])
+      
+      print(ggpairs(tail,
+                    title = paste("correlation: last 2,000 iterations of ", 
+                                  monitor[i]),
+                    progress = F))
+      }
+
+    }
+}
+```
+
+#### 1.2.4) Posterior Dist and Convergence Plots
+```{r user_functions_viz_4}
+posterior_plots <- function(mcmc_output_name, 
+                       mcmc_config, 
+                       observation_locations, 
+                       n.sites, 
+                       n.predictors,
+                       n.basis.refl, 
+                       n.basis.spat, 
+                       n.categories,
+                       near.dist = 0.02,
+                       far.dist = 0.15){
+
+  msg <- utils::capture.output(hold <- mcmc_config$printMonitors(), type="output")
+    
+  monitor <- strsplit(msg, split = "[:,]")
+  monitor <- unlist(monitor)
+  monitor <- monitor[2:length(monitor)]
+  monitor <- trimws(monitor, "b")
+  
+  target.sample <- mcmc_output_name
+  
+
+  dist.matrix <- as.matrix(dist(observation_locations))
+  dist.matrix[dist.matrix == 0] <- NA
+  
+  median.dist <- median(dist.matrix, na.rm = T)
+  dist.range <- far.dist - near.dist
+  
+  center  <- sample(1:n.sites, 1)
+  near <- which(dist.matrix[center, ] < near.dist)
+  far  <- which(dist.matrix[center, ] > far.dist)
+  med  <- which(dist.matrix[center, ] > 0.3*dist.range & dist.matrix[center, ] < 0.7*dist.range)
+  
+  site     <- sprintf("site.%s",seq(1:n.sites))
+  cate     <- sprintf("grp %s",seq(1:n.categories))
+  pred     <- sprintf("X%s",seq(1:n.predictors))
+  
+  # cate     <- c("Aspen", "Locust","Oak")
+  # pred     <- c("Intercept", "Elevation", "Slope", "N. Exposure", "E. Exposure", "H.L. Index", "T.Pos. Index", "T.Rug. Index")
+  basis    <- sprintf("basis %s",seq(1:max(n.basis.refl,n.basis.spat))) 
+  
+  
+  while (length(far) < 2){   
+    far.dist <- far.dist - (0.05 * far.dist)
+    far  <- as.vector(which(dist.matrix[center, ] > far.dist))}
+  
+  while (length(near) < 2){
+    near.dist <- far.dist + (0.05 * near.dist)
+    near  <-as.vector(which(dist.matrix[center, ] < near.dist))}
+  
+  while (length(med) < 2){
+    dist.range <- dist.range + (0.1 * dist.range)
+    med  <- as.vector(which(dist.matrix[center, ] > 0.3*dist.range & dist.matrix[center, ] < 0.7*dist.range))}
+  
+  for (i in 1:length(monitor)){
+ 
+      target.plot <- paste(target.sample, monitor[i], sep = ".")   
+      
+      eval(call("<-", "interest", as.name(target.plot)))
+      
+      print(paste("Working on plots for", target.plot)) 
+    # Posterior Convergence Plots (Alpha)
+    if (monitor[i] == "alpha"){
+      
+      sample.index <- sample(near, 2)
+      
+      par(mfrow = c(3, 6))
+      for(k in 1:dim(interest)[3]){
+        for(j in 1:length(sample.index)){
+          plot(density(interest[, sample.index[j] , k]), 
+               type="l", 
+               main=paste("Posterior density of", monitor[i], site[sample.index[j]], cate[k], "(close)"), 
+               xlab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+               ylab="Density")
+          # add PI line
+          lines(HPDinterval(as.mcmc(interest[, sample.index[j] , k])), c(0,0), 
+                col="red", 
+                cex=2, 
+                lty=3)  
+         # legend("topright", 
+         #        legend="95% HPD interval", 
+         #    )    lty=2, 
+         #        col="red", 
+         #        cex=0.5)
+          plot(1:length(interest[, sample.index[j] , k]), interest[, sample.index[j] , k], 
+               type="l", 
+                main=paste("MC history of", monitor[i], site[sample.index[j]], cate[k]), 
+               ylab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+                     xlab="Iteration")
+        }}
+    
+      
+      sample.index <- sample(far, 2)
+      
+      for(k in 1:dim(interest)[3]){
+        for(j in 1:length(sample.index)){
+          plot(density(interest[, sample.index[j] , k]), 
+               type="l", 
+               main=paste("Posterior of", monitor[i], site[sample.index[j]], cate[k], "(far)"), 
+               xlab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+               ylab="Density")
+          # add PI line
+          lines(HPDinterval(as.mcmc(interest[, sample.index[j] , k])), c(0,0), 
+                col="red", 
+                cex=2, 
+                lty=3)  
+         # legend("topright", 
+         #        legend="95% HPD interval", 
+         #    )    lty=2, 
+         #        col="red", 
+         #        cex=0.5)
+          plot(1:length(interest[, sample.index[j] , k]), interest[, sample.index[j] , k], 
+               type="l", 
+                main=paste("MC history of", monitor[i], site[sample.index[j]], cate[k]), 
+               ylab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+                     xlab="Iteration")
+        }}
+      
+      
+      sample.index <- sample(med, 2)
+      
+      for(k in 1:dim(interest)[3]){
+        for(j in 1:length(sample.index)){
+          plot(density(interest[, sample.index[j] , k]), 
+               type="l", 
+               main=paste("Posterior of", monitor[i], site[sample.index[j]], cate[k], "(med)"), 
+               xlab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+               ylab="Density")
+          # add PI line
+          lines(HPDinterval(as.mcmc(interest[, sample.index[j] , k])), c(0,0), 
+                col="red", 
+                cex=2, 
+                lty=3)  
+         # legend("topright", 
+         #        legend="95% HPD interval", 
+         #    )    lty=2, 
+         #        col="red", 
+         #        cex=0.5)
+          plot(1:length(interest[, sample.index[j] , k]), interest[, sample.index[j] , k], 
+               type="l", 
+                main=paste("MC history of", monitor[i], site[sample.index[j]], cate[k]), 
+               ylab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+                     xlab="Iteration")
+        }}
+      }
+    
+    # Posterior Convergence Plots (Betas)
+    if (monitor[i] == "beta"){
+     
+      par(mfrow = c(3, 6))
+      
+      for(k in 1:dim(interest)[3]){
+        for (r in 1:dim(interest)[2]) {
+        plot(density(interest[ , r, k]), 
+             type="l", 
+             main=paste("Posterior of", monitor[i], pred[r], cate[k]), 
+             xlab=paste(monitor[i], pred[r], cate[k]), 
+             ylab="Density")
+        # add PI line
+        lines(HPDinterval(as.mcmc(interest[ , r, k])), c(0,0), 
+              col="red", 
+              cex=2, 
+              lty=3)  
+       # legend("topright", 
+       #        legend="95% HPD interval", 
+       #    )    lty=2, 
+       #        col="red", 
+       #        cex=0.5)
+        plot(1:length(interest[ , r, k]), interest[ , r, k], 
+             type="l", 
+             main=paste("MC history of", monitor[i], pred[r], cate[k]), 
+             ylab=paste(monitor[i], pred[r], cate[k]), 
+             xlab="Iteration")
+        }}
+    }
+    
+    # Posterior Convergence Plots (Gamma)
+    if (monitor[i] == "gamma"){
+      
+      basis_subset <- sample(1:n.basis.refl, 2)
+      
+      par(mfrow = c(3, 4))
+        
+      for(k in 1:dim(interest)[3]){
+        for (q in 1:length(basis_subset)){ 
+         
+        plot(density(interest[ , basis_subset[q], k]), 
+             type="l", 
+             main=paste("Posterior of", monitor[i], basis[basis_subset[q]], cate[k]), 
+             xlab=paste(monitor[i], basis[basis_subset[q]], cate[k]), 
+             ylab="Density")
+        # add PI line
+        lines(HPDinterval(as.mcmc(interest[ , basis_subset[q], k])), c(0,0), 
+              col="red", 
+              cex=2, 
+              lty=3)  
+       # legend("topright", 
+       #        legend="95% HPD interval", 
+       #    )    lty=2, 
+       #        col="red", 
+       #        cex=0.5)
+        plot(1:length(interest[ , basis_subset[q], k]), interest[ , basis_subset[q], k], 
+             type="l", 
+             main=paste("MC history of", monitor[i], basis[basis_subset[q]], cate[k]), 
+             ylab=paste(monitor[i], basis[basis_subset[q]], cate[k]), 
+             xlab="Iteration")
+      }
+      }
+      
+       basis_subset <- sample(1:n.basis.refl, 2 * 4)
+       cate_subset <- sample(1:n.categories, 1)
+       
+       par(mfrow = c(3, 4))
+        
+       for (q in 1:length(basis_subset)) {
+        plot(density(interest[ , basis_subset[q], cate_subset]), 
+             type="l", 
+             main=paste("Posterior of", monitor[i], basis[basis_subset[q]], cate[cate_subset]), 
+             xlab=paste(monitor[i], basis[basis_subset[q]], cate[cate_subset]), 
+             ylab="Density")
+        # add PI line
+        lines(HPDinterval(as.mcmc(interest[ , basis_subset[q], cate_subset])), c(0,0), 
+              col="red", 
+              cex=2, 
+              lty=3)  
+       # legend("topright", 
+       #        legend="95% HPD interval", 
+       #    )    lty=2, 
+       #        col="red", 
+       #        cex=0.5)
+        plot(1:length(interest[ , basis_subset[q], cate_subset]), interest[ , basis_subset[q], cate_subset], 
+             type="l", 
+             main=paste("MC history of", monitor[i], basis[basis_subset[q]], cate[cate_subset]), 
+             ylab=paste(monitor[i], basis[basis_subset[q]], cate[cate_subset]), 
+             xlab="Iteration")
+        }
+    }
+  
+    # Posterior Convergence Plots (phi)
+    if (monitor[i] == "phi"){
+      
+      basis_subset <- sample(1:n.basis.spat, 2)
+      
+      par(mfrow = c(3, 4))
+        
+      for(k in 1:dim(interest)[3]){
+        for (q in 1:length(basis_subset)){ 
+         
+        plot(density(interest[ , basis_subset[q], k]), 
+             type="l", 
+             main=paste("Posterior of", monitor[i], basis[basis_subset[q]], cate[k]), 
+             xlab=paste(monitor[i], basis[basis_subset[q]], cate[k]), 
+             ylab="Density")
+        # add PI line
+        lines(HPDinterval(as.mcmc(interest[ , basis_subset[q], k])), c(0,0), 
+              col="red", 
+              cex=2, 
+              lty=3)  
+       # legend("topright", 
+       #        legend="95% HPD interval", 
+       #    )    lty=2, 
+       #        col="red", 
+       #        cex=0.5)
+        plot(1:length(interest[ , basis_subset[q], k]), interest[ , basis_subset[q], k], 
+             type="l", 
+             main=paste("MC history of", monitor[i], basis[basis_subset[q]], cate[k]), 
+             ylab=paste(monitor[i], basis[basis_subset[q]], cate[k]), 
+             xlab="Iteration")
+      }
+      }
+      
+       basis_subset <- sample(1:n.basis.spat, 2 * 4)
+       cate_subset <- sample(1:n.categories, 1)
+       
+       par(mfrow = c(3, 4))
+        
+       for (q in 1:length(basis_subset)) {
+        plot(density(interest[ , basis_subset[q], cate_subset]), 
+             type="l", 
+             main=paste("Posterior of", monitor[i], basis[basis_subset[q]], cate[cate_subset]), 
+             xlab=paste(monitor[i], basis[basis_subset[q]], cate[cate_subset]), 
+             ylab="Density")
+        # add PI line
+        lines(HPDinterval(as.mcmc(interest[ , basis_subset[q], cate_subset])), c(0,0), 
+              col="red", 
+              cex=2, 
+              lty=3)  
+       # legend("topright", 
+       #        legend="95% HPD interval", 
+       #    )    lty=2, 
+       #        col="red", 
+       #        cex=0.5)
+        plot(1:length(interest[ , basis_subset[q], cate_subset]), interest[ , basis_subset[q], cate_subset], 
+             type="l", 
+             main=paste("MC history of", monitor[i], basis[basis_subset[q]], cate[cate_subset]), 
+             ylab=paste(monitor[i], basis[basis_subset[q]], cate[cate_subset]), 
+             xlab="Iteration")
+        }
+    }
+        
+    # Posterior Convergence Plots (L2 group)
+    if (monitor[i] == "L2group"){
+      par(mfrow = c(3, 4))
+      
+      for(k in 1:dim(interest)[3]){
+        for (r in 1:dim(interest)[2]) {
+        plot(density(interest[ , r, k]), 
+             type="l", 
+             main=paste("Posterior of", monitor[i], pred[r], cate[k]), 
+             xlab=paste(monitor[i], pred[r], cate[k]), 
+             ylab="Density")
+        # add PI line
+        lines(HPDinterval(as.mcmc(interest[ , r, k])), c(0,0), 
+              col="red", 
+              cex=2, 
+              lty=3)  
+       # legend("topright", 
+       #        legend="95% HPD interval", 
+       #    )    lty=2, 
+       #        col="red", 
+       #        cex=0.5)
+        plot(1:length(interest[ , r, k]), interest[ , r, k], 
+             type="l", 
+             main=paste("MC history of", monitor[i], pred[r], cate[k]), 
+             ylab=paste(monitor[i], pred[r], cate[k]), 
+             xlab="Iteration")
+        }}
+    }
+    
+    # Posterior Convergence Plots (L2 effect)
+    if (monitor[i] == "L2effect"){
+      par(mfrow = c(3, 4))
+      
+      for(k in 1:dim(interest)[3]){
+        for (r in 1:dim(interest)[2]) {
+        plot(density(interest[ , r, k]), 
+             type="l", 
+             main=paste("Posterior of", monitor[i], pred[r], cate[k]), 
+             xlab=paste(monitor[i], pred[r], cate[k]), 
+             ylab="Density")
+        # add PI line
+        lines(HPDinterval(as.mcmc(interest[ , r, k])), c(0,0), 
+              col="red", 
+              cex=2, 
+              lty=3)  
+       # legend("topright", 
+       #        legend="95% HPD interval", 
+       #    )    lty=2, 
+       #        col="red", 
+       #        cex=0.5)
+        plot(1:length(interest[ , r, k]), interest[ , r, k], 
+             type="l", 
+             main=paste("MC history of", monitor[i], pred[r], cate[k]), 
+             ylab=paste(monitor[i], pred[r], cate[k]), 
+             xlab="Iteration")
+        }}
+    }
+    
+    # Posterior Convergence Plots (L1 group)
+    if (monitor[i] == "L1group"){
+      par(mfrow = c(3, 4))
+      
+      for(k in 1:dim(interest)[3]){
+        for (r in 1:dim(interest)[2]) {
+        plot(density(interest[ , r, k]), 
+             type="l", 
+             main=paste("Posterior of", monitor[i], pred[r], cate[k]), 
+             xlab=paste(monitor[i], pred[r], cate[k]), 
+             ylab="Density")
+        # add PI line
+        lines(HPDinterval(as.mcmc(interest[ , r, k])), c(0,0), 
+              col="red", 
+              cex=2, 
+              lty=3)  
+       # legend("topright", 
+       #        legend="95% HPD interval", 
+       #    )    lty=2, 
+       #        col="red", 
+       #        cex=0.5)
+        plot(1:length(interest[ , r, k]), interest[ , r, k], 
+             type="l", 
+             main=paste("MC history of", monitor[i], pred[r], cate[k]), 
+             ylab=paste(monitor[i], pred[r], cate[k]), 
+             xlab="Iteration")
+        }}
+    }
+    
+    # Posterior Convergence Plots (L1 effect)
+    if (monitor[i] == "L1effect"){
+      par(mfrow = c(3, 4))
+      
+      for(k in 1:dim(interest)[3]){
+        for (r in 1:dim(interest)[2]) {
+        plot(density(interest[ , r, k]), 
+             type="l", 
+             main=paste("Posterior of", monitor[i], pred[r], cate[k]), 
+             xlab=paste(monitor[i], pred[r], cate[k]), 
+             ylab="Density")
+        # add PI line
+        lines(HPDinterval(as.mcmc(interest[ , r, k])), c(0,0), 
+              col="red", 
+              cex=2, 
+              lty=3)  
+       # legend("topright", 
+       #        legend="95% HPD interval", 
+       #    )    lty=2, 
+       #        col="red", 
+       #        cex=0.5)
+        plot(1:length(interest[ , r, k]), interest[ , r, k], 
+             type="l", 
+             main=paste("MC history of", monitor[i], pred[r], cate[k]), 
+             ylab=paste(monitor[i], pred[r], cate[k]), 
+             xlab="Iteration")
+        }}
+    }
+    
+    # Posterior Convergence Plots (all Probabilities)
+    if (monitor[i] == "prob"){
+      
+      par(mfrow = c(3, 2))
+      
+      for(k in 1:dim(interest)[3]){
+        plot(density(rowSums(interest[, , k])/dim(interest)[2]), 
+             type="l", 
+             main=paste("Posterior of", monitor[i], cate[k], "(all sites)"), 
+             xlab=paste("Site avg. of", monitor[i], cate[k]), 
+             ylab="Density")
+        # add PI line
+        lines(HPDinterval(as.mcmc(rowSums(interest[, , k])/dim(interest)[2])), c(0,0), 
+              col="red", 
+              cex=2, 
+              lty=3)  
+       # legend("topright", 
+       #        legend="95% HPD interval", 
+       #    )    lty=2, 
+       #        col="red", 
+       #        cex=0.5)
+        plot(1:length(rowSums(interest[, , k])/dim(interest)[2]), rowSums(interest[, , k])/dim(interest)[2], 
+             type="l", 
+              main=paste("MC history of", monitor[i], cate[k], "(all sites)"), 
+              ylab=paste("Site avg. of", monitor[i], cate[k]), 
+              xlab="Iteration")
+      }
+    # Posterior Convergence Plots (Individual Probabilities)
+      sample.index <- sample(near, 2)
+      
+      par(mfrow = c(3, 4))
+      for(k in 1:dim(interest)[3]){
+        for(j in 1:length(sample.index)){
+          plot(density(interest[, sample.index[j] , k]), 
+               type="l", 
+               main=paste("Posterior of", monitor[i], site[sample.index[j]], cate[k], "(near)"), 
+               xlab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+               ylab="Density")
+          # add PI line
+          lines(HPDinterval(as.mcmc(interest[, sample.index[j] , k])), c(0,0), 
+                col="red", 
+                cex=2, 
+                lty=3)  
+         # legend("topright", 
+         #        legend="95% HPD interval", 
+         #    )    lty=2, 
+         #        col="red", 
+         #        cex=0.5)
+          plot(1:length(interest[, sample.index[j] , k]), interest[, sample.index[j] , k], 
+               type="l", 
+                main=paste("MC history of", monitor[i], site[sample.index[j]], cate[k]), 
+               ylab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+                     xlab="Iteration")
+        }}
+    
+      
+      sample.index <- sample(far, 2)
+      
+      par(mfrow = c(3, 4))
+      for(k in 1:dim(interest)[3]){
+        for(j in 1:length(sample.index)){
+          plot(density(interest[, sample.index[j] , k]), 
+               type="l", 
+               main=paste("Posterior of", monitor[i], site[sample.index[j]], cate[k], "(far)"), 
+               xlab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+               ylab="Density")
+          # add PI line
+          lines(HPDinterval(as.mcmc(interest[, sample.index[j] , k])), c(0,0), 
+                col="red", 
+                cex=2, 
+                lty=3)  
+         # legend("topright", 
+         #        legend="95% HPD interval", 
+         #    )    lty=2, 
+         #        col="red", 
+         #        cex=0.5)
+          plot(1:length(interest[, sample.index[j] , k]), interest[, sample.index[j] , k], 
+               type="l", 
+                main=paste("MC history of", monitor[i], site[sample.index[j]], cate[k]), 
+               ylab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+                     xlab="Iteration")
+        }}
+      
+      
+      sample.index <- sample(med, 2)
+      
+      par(mfrow= c(3, 4))
+      for(k in 1:dim(interest)[3]){
+        for(j in 1:length(sample.index)){
+          plot(density(interest[, sample.index[j] , k]), 
+               type="l", 
+               main=paste("Posterior of", monitor[i], site[sample.index[j]], cate[k], "(med)"), 
+               xlab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+               ylab="Density")
+          # add PI line
+          lines(HPDinterval(as.mcmc(interest[, sample.index[j] , k])), c(0,0), 
+                col="red", 
+                cex=2, 
+                lty=3)  
+         # legend("topright", 
+         #        legend="95% HPD interval", 
+         #    )    lty=2, 
+         #        col="red", 
+         #        cex=0.5)
+          plot(1:length(interest[, sample.index[j] , k]), interest[, sample.index[j] , k], 
+               type="l", 
+                main=paste("MC history of", monitor[i], site[sample.index[j]], cate[k]), 
+               ylab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+                     xlab="Iteration")
+        }}
+      }
+  
+    # Posterior Convergence Plots (spatial effect)
+    if (monitor[i] == "spatial_process"){
+    
+      sample.index <- sample(near, 2)
+      
+      par(mfrow = c(3, 4))
+      for(k in 1:dim(interest)[3]){
+        for(j in 1:length(sample.index)){
+          plot(density(interest[, sample.index[j] , k]), 
+               type="l", 
+               main=paste("Posterior of", monitor[i], site[sample.index[j]], cate[k], "(near)"), 
+               xlab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+               ylab="Density")
+          # add PI line
+          lines(HPDinterval(as.mcmc(interest[, sample.index[j] , k])), c(0,0), 
+                col="red", 
+                cex=2, 
+                lty=3)  
+         # legend("topright", 
+         #        legend="95% HPD interval", 
+         #    )    lty=2, 
+         #        col="red", 
+         #        cex=0.5)
+          plot(1:length(interest[, sample.index[j] , k]), interest[, sample.index[j] , k], 
+               type="l", 
+                main=paste("MC history of", monitor[i], site[sample.index[j]], cate[k]), 
+               ylab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+                     xlab="Iteration")
+        }}
+    
+      
+      sample.index <- sample(far, 2)
+      
+      par(mfrow = c(3, 4))
+      for(k in 1:dim(interest)[3]){
+        for(j in 1:length(sample.index)){
+          plot(density(interest[, sample.index[j] , k]), 
+               type="l", 
+               main=paste("Posterior of", monitor[i], site[sample.index[j]], cate[k], "(far)"), 
+               xlab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+               ylab="Density")
+          # add PI line
+          lines(HPDinterval(as.mcmc(interest[, sample.index[j] , k])), c(0,0), 
+                col="red", 
+                cex=2, 
+                lty=3)  
+         # legend("topright", 
+         #        legend="95% HPD interval", 
+         #    )    lty=2, 
+         #        col="red", 
+         #        cex=0.5)
+          plot(1:length(interest[, sample.index[j] , k]), interest[, sample.index[j] , k], 
+               type="l", 
+                main=paste("MC history of", monitor[i], site[sample.index[j]], cate[k]), 
+               ylab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+                     xlab="Iteration")
+        }}
+      
+      
+      sample.index <- sample(med, 2)
+      
+      par(mfrow = c(3, 4))
+      for(k in 1:dim(interest)[3]){
+        for(j in 1:length(sample.index)){
+          plot(density(interest[, sample.index[j] , k]), 
+               type="l", 
+               main=paste("Posterior of", monitor[i], site[sample.index[j]], cate[k], "(med)"), 
+               xlab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+               ylab="Density")
+          # add PI line
+          lines(HPDinterval(as.mcmc(interest[, sample.index[j] , k])), c(0,0), 
+                col="red", 
+                cex=2, 
+                lty=3)  
+         # legend("topright", 
+         #        legend="95% HPD interval", 
+         #    )    lty=2, 
+         #        col="red", 
+         #        cex=0.5)
+          plot(1:length(interest[, sample.index[j] , k]), interest[, sample.index[j] , k], 
+               type="l", 
+                main=paste("MC history of", monitor[i], site[sample.index[j]], cate[k]), 
+               ylab=paste(monitor[i], site[sample.index[j]], cate[k]), 
+                     xlab="Iteration")
+        }}
+    }
+    
+    # Posterior Convergence Plots (scalars)
+    if (monitor[i] == "sigma"){
+
+      sigma <- as.vector(interest)
+      par(mfrow = c(1, 2))
+      
+      plot(density(sigma),
+             type = "l",
+             main = paste("Posterior of ", monitor[i]),
+             xlab = monitor[i], 
+             ylab = "Density")
+      # add PI line
+        lines(HPDinterval(as.mcmc(sigma)),
+              y = c(0, 0),
+              col = "red",
+              cex = 2,
+              lty = 3)
+        
+      # legend("topright",
+      #        legend="95% HPD interval",
+      #    )    lty=2,
+      #        col="red",
+      #        cex=0.5)
+        plot(1:length(sigma),
+             y = sigma,
+             type = "l",
+             main = paste("MC history of", monitor[i], " "),
+             ylab = monitor[i],
+             xlab = "Iteration")
+    }
+  }
+}
+```
+
+#### 1.2.4) Marginal Probability Curves All Iter. Avg.
+```{r user_functions_viz_5}
+prob_curves_agg <- function(mcmc_output_name = "mcmc.sample", 
+                            X_matrix, 
+                            Y_matrix){ 
+  
+  target.X <- X_matrix
+  
+  target.Y <- Y_matrix
+  
+  target.plot <- paste(mcmc_output_name, "prob", sep = ".")  
+  
+  eval(call("<-", "interest", as.name(target.plot)))
+  
+  n.categories <- dim(interest)[3]
+  n.predictors <- dim(target.X)[2]
+  
+  # cate     <- sprintf("Grp %s",seq(1:n.categories))
+  # pred     <- sprintf("X%s",seq(1:n.predictors))
+  
+  cate     <- c("Aspen", "Locust","Oak")
+  pred     <- c("Intercept", "Elevation", "Slope", "N. Exposure", "E. Exposure", "H.L. Index", "T.Pos. Index", "T.Rug. Index")
+  
+  
+  par(mfrow = c((n.predictors -1), n.categories))
+  
+  for(r in 2:n.predictors) {
+    for (k in 1:n.categories) {
+  X.plot  <- unlist(target.X[, r]  )  # skip intercept
+  Y.plot  <- target.Y[, k] 
+  Prob.mean  <- colSums(interest[, , k]) / dim(interest[, , k])[1]
+  lo.line <- loess(Prob.mean ~ X.plot, degree = 2, span = 0.25)
+  plot(x = X.plot, 
+       y = Prob.mean, 
+       col = rgb(red = 1, green = 0, blue = 0, alpha = 0.30), 
+       ylim = c(0, 1),
+       ylab = "Probability",
+       xlab = paste(pred[r], cate[k]),
+       main = paste("Prob. Curve of", pred[r], "and", cate[k])
+       )
+  points(x = X.plot, y =  Y.plot) 
+  lines(x = X.plot[order(X.plot)], 
+        y = lo.line$fitted[order(X.plot)], 
+        col = "red", 
+        lwd = 2)
+    }}
+}
+```
+
+#### 1.2.5) Marginal Probability Curves By Iter. for Uncertainty
+```{r user_functions_viz_6}
+prob_curves_iter <- function(mcmc_output_name, 
+                             X_matrix, grid_length, predictors){
+  
+  grid_start <- floor(min(X_matrix))
+  grid_stop <- ceiling(max(X_matrix))
+  
+  grid_values <- seq(grid_start, grid_stop, l = grid_length)
+  
+  target.beta <- paste(mcmc_output_name, "beta", sep = ".")
+  
+  eval(call("<-", "interest", as.name(target.beta)))
+  
+  n.categories <- dim(interest)[3]
+  n.predictors <- dim(X_matrix)[2]
+  
+  # cate     <- sprintf("Grp %s",seq(1:n.categories))
+  # pred     <- sprintf("X%s",seq(1:n.predictors))
+  
+  cate     <- c("Aspen", "Locust","Oak")
+  pred     <- c("Intercept", "Elevation", "Slope", "N. Exposure", "E. Exposure", "H.L. Index", "T.Pos. Index", "T.Rug. Index")
+  
+  colnames(interest) <- pred
+  
+  par(mfrow = c((length(predictors) -1), n.categories), 
+      mar = c(1, 1, 1.5, 0.1),         # margin total:  Bot, Left, Top, Right 
+      oma = c(2.0, 2.2, 3.0, 0.0),         # mtext area: Bot, Left, Top, Right
+      mgp = c(1.9, 0.3,  0),               # location: axis title, labels, line
+      cex=1.5,                             # scaler
+      tcl = -0.1)                          # tick length
+  
+  r = 2
+  
+  
+  for (beta in predictors[-1]) { 
+    alpha <- sapply(1:n.categories, function(k) exp(cbind(1, grid_values) %*% t(interest[, c('Intercept', beta), k])))
+    
+    prob  <- array(alpha / rowSums(alpha), dim = c(grid_length, nrow(interest), n.categories))    
+    
+    for(k in 1:3){
+      xaxt <- yaxt <- "n"
+      
+      if (beta == predictors[length(predictors)]){ xaxt <- "s"}
+      
+      matplot(grid_values, 
+              prob[, sample(1:nrow(interest), size = 500), k], 
+              type = "l", 
+              col = scales::alpha("black", 0.06), 
+              lty = 1,
+              ylim = c(0, 1),
+              ylab = "",
+              xlab = "",
+              xaxt = xaxt,
+              yaxt = yaxt,
+              main = paste(predictors[r], "on", cate[k]))
+      
+      matlines(grid_values, 
+               t(apply(prob[, , k], 1, quantile, probs = c(0.025, 0.975))), 
+               col = 2, 
+               lty = 3, lwd = 2)
+      
+      lines(grid_values,
+            apply(prob[, , k], 1, median),
+            lwd = 3)
+      
+      if (k == 1){axis(2)}
+    } # PLOT LOOP
+    r <- r + 1
+  } # BETA LOOP
+  mtext("Normalized Covariate Values",side=1,line=1,outer=TRUE,cex=2)
+  mtext("Probability of Classification",side=2,line=1,outer=TRUE,cex=2,las=0)
+  mtext("Covariate Influence on Probability of Class Membership",side=3,line=1,outer=TRUE,cex=3.0)
+} # END FUNCTION
+
+```
+
+
+## 2) Datasets & Data Objects
+
+- code for objects: agg_band_data, sent2_bands, NM_locations.df, NM_locations.sf, NM_locations.ppp
+
+```{r loaded_data, eval= FALSE}
+
+
+######## SHAPEFILE OBJECT FROM KENT TEAM #######
+NM_locations.sf <- read_sf(dsn = paste0(fp_data_obj, "KSU"), layer = "NM_ID_Points")
+NM_locations.ppp <- as.ppp(st_geometry(NM_locations.sf))
+
+NM_locations.sf <- st_transform(NM_locations.sf, crs = 4326, quiet = T)
+
+NM_locations.df <- NM_locations.sf
+
+NM_coords.df <- sf::st_coordinates(NM_locations.sf)
+
+NM_coords.df <- as.data.frame(NM_coords.df)
+
+NM_locations.df  <- as.data.frame(NM_locations.df[, c("Id", "IDENT", "Year", "Comment")])
+
+NM_locations.df <- NM_locations.df[1:4]
+
+Type <- NM_locations.df$Comment
+
+for (i in 1:length(Type)){
+  if (Type[i] == "Aspen"){Type[i] <- 1}
+  else if (Type[i] == "Locust"){Type[i] <- 2}    
+  else {Type[i] <- 3}  
+  }
+
+
+Type <- as.numeric(Type)
+
+NM_locations.df <- cbind(NM_locations.df[1:3], Type, NM_coords.df)
+
+######## COVARIATES FOR ANALYSIS #########
+
+covariates <- read.csv(paste0(fp_raw_data, "/NM_topo_vars.csv"))
+covariates <- covariates[, 2:9]
+
+NM_locations.df <- left_join(NM_locations.df, covariates, by = c("Id" = "ID"))
+
+colnames(NM_locations.df) <- c("Id", "IDENT", "Year", "Type", "X", "Y", "Elevation", "Slope", "North_Exposure", "East_Exposure", "Heat_Load_Index", "Topo_Position_Index", "Topo_Ruggedness_Index")
+
+######## SENTINEL 2 INFORMATIOM ###############
+helper = "Sentinel2_bands.csv"
+
+
+sent2_bands <- read.csv(paste0(fp_raw_data, "/Sentinel2_bands.csv"))
+sent2_bands$BAND <- factor(sent2_bands$BAND, ordered = T, 
+                           levels = c("1","2","3","4","5",
+                                         "6", "7", "8", "8A", "9",
+                                         "10", "11", "12"))
+
+# band selector
+sent2_bands[1:2]
+
+study_bands  <- sent2_bands[c(1:10,12:13) , "WAVELENGTH_nm"]
+band_names   <- sent2_bands[c(1:10,12:13) , "BAND"]
+source_bands_idx <- c(4,5,6,7,8,9,10,12,11,13,2,3)
+
+
+
+######## BAND DATA FOR ANALYSIS #########
+band_file_names <- list.files(path = paste0(fp_raw_data), 
+                              pattern = "NM_Sentinel2_")
+
+regex <- "(?<=_B)([0-9]+[a-zA-Z]*)(?=\\.)"
+
+band_id  <- stringr::str_extract_all(band_file_names, regex, simplify = T)
+
+band_data <- list()
+
+for (f in 1:length(band_file_names)){
+
+  band_template   <- read.csv(paste0(fp_raw_data, band_file_names[f]))
+  
+  site.ids <- band_template[,"Id"]
+  site.geo <- band_template[,".geo"]
+  
+  band_template <- left_join(band_template, NM_locations.df[,1:6], "Id")
+  
+  ref.vals <- band_template[,2:(ncol(band_template)-8)]
+  
+  ind <- which(!(ref.vals == -9999), arr.ind = T)
+  
+  possible.days <- colnames(band_template)
+  
+  possible.days <- possible.days[-1]
+  
+  possible.days <- stringr::str_extract(possible.days, "[0-9]+")
+  
+  possible.days <- lubridate::ymd(possible.days)
+  
+  possible.days <- lubridate::yday(possible.days)
+  
+  
+  
+  
+  hold <- data.frame(matrix(nrow = nrow(ind), ncol = 8))
+  
+  cnames <- c("day_of_year", "Id", "Type", "Longitude", "Latitude", "Band", "Wavelength", "Reflectance")
+  
+  colnames(hold) <- cnames
+  
+  for (i in 1:nrow(ind)){
+    hold[i, "day_of_year"] <- possible.days[ind[i, 2]]
+    hold[i, "Id"] <- band_template[ind[i, 1], "Id"]  
+    hold[i, "Type"]  <- band_template[ind[i, 1], "Type"]
+    hold[i, "Longitude"] <- band_template[ind[i, 1], "X"]
+    hold[i, "Latitude"]   <- band_template[ind[i, 1], "Y"]
+    hold[i, "Band"] <- band_id[f]
+    hold[i, "Wavelength"] <- sent2_bands[sent2_bands$BAND==band_id[f], "WAVELENGTH_nm"]
+    hold[i, "Reflectance"] <- ref.vals[ind[i, 1], ind[i, 2]] * 0.0001
+  }
+
+  band_data[[f]] <- hold
+}
+
+agg_band_data <- rbind(band_data[[1]], 
+                       band_data[[2]],
+                       band_data[[3]],
+                       band_data[[4]],
+                       band_data[[5]],
+                       band_data[[6]],
+                       band_data[[7]],
+                       band_data[[8]],
+                       band_data[[9]],
+                       band_data[[10]])
+
+rm(NM_coords.df, Type, hold, helper, ind, band_id, band_template, band_data, ref.vals, covariates)
+
+```
+
+
+
+## 3) Exploratory Analysis on Observed Data.
+
+### 3.1) Response and Covariate Values at Observed Locations
+
+```{r }
+NM_locations.temp <- NM_locations.df
+
+###### LOCATIONS ADDED BY YEAR
+table(NM_locations.temp[, c("Year", "Id")])
+
+##### Investigate IDENT #####
+table(NM_locations.temp[, c("Year", "IDENT")])
+
+##### INVESTIGATE LANDCOVER TYPE #####
+table(NM_locations.temp[, c("Type", "Year")])
+
+
+######## DATAFRAME FOR SIMPLE COORDINATES ##
+target.Y <- NM_locations.temp$Type
+
+for (i in 1:length(target.Y)){
+  if (target.Y[i] == 1){target.Y[i] <- "Aspen"}
+  else if (target.Y[i] == 2){target.Y[i] <- "Locust"}    
+  else {target.Y[i] <- "Oak"}  
+  }
+
+NM_locations.temp$Type <- target.Y
+
+###### ALL 60 SITES HAVE UNIQUE LONG/LAT COORDS
+length(unique(NM_locations.temp$X))
+length(unique(NM_locations.temp$X + NM_locations.temp$Y))
+
+X_max  <- max(NM_locations.temp$X)
+X_min  <- min(NM_locations.temp$X)
+Y_max  <- max(NM_locations.temp$Y)
+Y_min  <- min(NM_locations.temp$Y)
+
+X_center <- (X_max + X_min)/2
+X_center <- X_center + 0.051
+
+Y_center <- (Y_max + Y_min)/2
+
+loc <- c(X_center, Y_center)
+
+###### facts about study area ########
+SANTE_FE <- c(-105.964444, 35.667222)
+ALBUQUERQUE <- c(-106.61, 35.110833)
+locs <- as.data.frame(rbind(loc, SANTE_FE, ALBUQUERQUE))
+proj <- st_crs(NM_locations.sf)
+locs <- st_as_sf(x = locs, 
+                 coords = c("V1", "V2"), 
+                 crs = proj)
+
+locs <- st_distance(locs)
+
+locs <- as.data.frame(rbind(c("Sante Fe", locs[1,2]),
+                            c("Albuquerque", locs[1,3])))
+
+colnames(locs) <- c("City", "Meters")
+
+
+study_area <- boundingbox(NM_locations.ppp)
+study_area_poly <- st_as_sfc(study_area, crs = 32613)
+st_crs(study_area_poly) <- 32613
+study_area_poly <- st_transform(study_area_poly, crs = 4326)
+
+
+study_area_facts <- list(area = area.owin(study_area),
+                         width = study_area[[2]][2]-study_area[[2]][1], 
+                         height = study_area[[3]][2]-study_area[[3]][1],
+                         units = "meters",
+                         site_avgs = colMeans(NM_locations.df[,7:13]),
+                         dist_nearby_metro = locs) 
+
+################## Map of points #########################
+NM1 <- get_googlemap(loc, 
+                    zoom = 6, 
+                    size = c(640, 640), 
+                    scale = 2, 
+                    maptype = "hybrid")
+
+ggmap(NM1) + geom_sf(data = study_area_poly, 
+                     col = "red", fill = NA, 
+                     size =2, 
+                     inherit.aes = FALSE) + 
+  ggtitle("Study Area Location in U.S. Southwest") +
+  coord_sf() 
+
+
+NM2 <- get_googlemap(loc, 
+                    zoom = 12, 
+                    size = c(640, 640), 
+                    scale = 2, 
+                    maptype = "hybrid")
+
+ggmap(NM2) + geom_point(data = NM_locations.temp, 
+                      aes(X, Y, col = as.factor(Type)),
+                      size = 1.5) +
+  labs("Forest Species") +
+  ggtitle("Observation Sites By Forest Species")
+
+################## Map of fire history #########################
+
+
+NM_fires.sf <- read_sf(dsn = paste0(fp_data_obj, "MTBS"), layer = "firefinal")
+
+fire_dates <- NM_fires.sf$Fire_Dates
+
+fire_dates[c(21,22,23,27,28,29,30,31,33,34)] <- 2011
+fire_dates[24] <- 2000
+fire_dates[25] <- 2013
+fire_dates[26] <- 2010
+fire_dates[32] <- 2016
+
+NM_fires.sf$Final_Fire <- fire_dates
+
+NM_locations.temp$Id <- as.character(NM_locations.temp$Id)
+
+
+bbox_new <- st_bbox(NM_fires.sf)
+
+x.range <- bbox_new$xmax - bbox_new$xmin 
+
+# bbox_new[3] <- bbox_new[3] + (0.32 * x.range)
+
+bbox_new <-  st_as_sfc(bbox_new)
+
+
+tm_shape(NM_fires.sf, bbox = bbox_new) + 
+  tm_polygons("Fire_Dates")+
+tm_shape(NM_locations.sf) +  
+  tm_symbols(shape = 43, col = "blue")+
+  tm_layout(main.title = "Fire History of Jemez Mountains", 
+            frame = FALSE, 
+            legend.outside = TRUE)
+
+
+tm_shape(NM_fires.sf, bbox = bbox_new) + 
+  tm_polygons("Final_Fire")+
+tm_shape(NM_locations.sf) +  
+  tm_symbols(shape = 43, col = "blue") + 
+  tm_layout(main.title = "Last Fire of Jemez Mountains", 
+            frame = FALSE, 
+            legend.outside = TRUE)
+
+
+rm(NM_locations.temp, X_max, X_min, Y_max, Y_min, X_center, Y_center, loc, locs, proj)
+```
+
+
+### 3.2) Mosaic Plot - What Values of Covariates are Found Within Each Group
+
+```{r response_plot_mosaic}
+
+target.X <- NM_locations.df[,c("Elevation", "Slope", "North_Exposure", "East_Exposure", "Heat_Load_Index", "Topo_Position_Index", "Topo_Ruggedness_Index")]
+
+target.Y <- NM_locations.df$Type
+
+for (i in 1:length(target.Y)){
+  if (target.Y[i] == 1){target.Y[i] <- "Aspen"}
+  else if (target.Y[i] == 2){target.Y[i] <- "Locust"}    
+  else {target.Y[i] <- "Oak"}  
+  }
+
+#####################################################################
+X.df <- data.frame(matrix(nrow=dim(target.X)[1],ncol=dim(target.X)[2]))
+
+var.names <- vector(mode = "character", length = ncol(target.X))
+
+for (i in 1:ncol(target.X)) {
+quant_breaks <- quantile(unlist(target.X[ , i]), probs = c(0.25,0.75))  
+var.names[i] <- colnames(target.X)[i]
+
+X.vec <- dplyr::select(target.X, !!var.names[i])
+
+X.vec  <- case_when(X.vec < quant_breaks[1] ~ "Low", 
+                                        X.vec > quant_breaks[1] & X.vec  < quant_breaks[2]  ~ "Med",
+                                        X.vec > quant_breaks[2] ~ "High",
+                                        # catch condition- without, will NA remaining entries
+                                        TRUE ~ as.character(X.vec))
+
+X.vec <- factor(X.vec, levels = c("Low", "Med", "High"), ordered = T)
+
+X.df[, i] <- X.vec
+}
+
+colnames(X.df) <- var.names
+
+df.plot   <- as.data.frame(cbind(X.df, target.Y))
+
+for (i in 1:ncol(target.X)) {
+table.plot <- table(df.plot[, ncol(df.plot)], df.plot[, i])
+
+mosaic.plot  <- mosaicplot(table.plot, 
+                           main = paste("Mosaic Plot for ", var.names[i], sep = ""), 
+                           xlab = "Group Membership",
+                           ylab = eval(var.names[i]),
+                           color = T)    
+
+print(mosaic.plot)
+}
+
+
+rm(target.X, target.Y, X.df, df.plot)
+```
+
+### 3.3) Correlation matrix
+```{r covariate_correlation}
+print(ggpairs(NM_locations.df[,7:13],
+              title = "Abiotic Covariate Correlation",
+              progress = F))
+```
+
+
+### 3.4) Reflectance values on logit scale: quick example
+```{r}
+layout(matrix(1:12, 3, 4))
+
+colors <- RColorBrewer::brewer.pal(3, "Dark2")
+
+for(band in unique(agg_band_data$Band)){
+  plot(c(1, 365), c(-3.5, 0.5), type = "n", main = band, 
+       xlab = "day_of_year", ylab = "logit(Reflectance)")
+  for(type in 1:3){
+    data <- agg_band_data[agg_band_data$Band == band & agg_band_data$Type == type, ]
+    points(1:365, sapply(1:365, function(d) median(logit(data[data$day_of_year == d, "Reflectance"]))),
+           col = colors[type], cex = 0.7, pch = 16) ## daily medians
+    # points(Reflectance ~ day_of_year, data = data, col = scales::alpha(colors[type], 0.01))
+  }
+}
+```
+
+
+## 4) Reflectance Model
+
+*Thesis notation to R notation*
+- $\mathbf{r(s)}$ is logit_reflectance[]
+- $\mathbf{u(s)}$ is surface[]
+- $\mathbf{Y(s)}$ is y[,]
+- $\mathbf{G}$    is G
+- $\mathbf{\Gamma}$ is gamma[,]
+- $\sigma_{\varepsilon}^{2}$ is sigma
+- $\mathbf{P(s)}$ is prob[,]
+- $\mathbf{A(s)}$ is alpha[,]
+- $\mathbf{X(s)}$ is X[,]
+- $\mathbf{B}$    is beta[,]
+- $\mathbf{X(s)}$ is spatial_process[,]
+- $\mathbf{H}$    is H
+- $\mathbf{\Psi}$ is phi[,]
+
+*tuning parameter association*
+-$\tau_{\beta}$        is scalar of beta.prior_cov
+-$\tau_{\gamma}$       is scalar of gamma.prior_cov
+-$\tau_{\psi}$         is scalar of psi.prior_cov
+-$\tau_{\varepsilon}$  is scalar of error_var.prior_2
+-$Q$                   is n.ref_basis
+-$J$                   is n.spat_basis
+
+*notes & warnings*
+- Special parameters are L2 norms of beta parameters, not used in final analysis.
+
+### 4.1) Nimble Model Code
+```{r nimble_model}
+
+###################  NIMBLE MODEL CODE  ########################################
+model.code <- nimbleCode({
+  
+###################  PRIORS  ###################################################
+  sigma ~ dunif(error_var.prior_1, error_var.prior_2)
+
+  for (k in 1:K) { 
+    beta[1:R, k] ~ dmnorm(mean = beta.prior_mean[1:R],
+                          cov = beta.prior_cov[1:R, 1:R])
+    }
+
+  for (j in 1:J) {
+    phi[j, 1:K] ~ dmnorm(mean = phi.prior_mean[1:K],    
+                           cov = phi.prior_cov[1:K, 1:K])
+  }
+  
+  for (q in 1:Q) {
+    gamma[q, 1:K] ~ dmnorm(mean = gamma.prior_mean[1:K], 
+                            cov = gamma.prior_cov[1:K, 1:K])
+  }
+    
+###################  MODEL REFLECTANCE SURFACE  ################################
+  for (m in 1:m_star) {
+    surface[m] <-  inprod(G[m, 1:Q], gamma[1:Q, k_s_by_measurement[m]])  
+    
+    logit_reflectance[m] ~ dnorm(surface[m], sd = sigma)
+  }
+  
+###################  "NATURAL" PROBABILITIES FOR LANDCOVER TYPE MODEL  #########
+  spatial_process[1:n, 1:K] <- H[1:n, 1:J] %*% phi[1:J, 1:K]
+  
+  for (k in 1:K){
+    log(alpha[1:n, k]) <- X[1:n, 1:R] %*% beta[1:R, k] + spatial_process[1:n, k] 
+  }                                                                            
+  
+###################  MODEL LANDCOVER TYPE  ##################################### 
+  for(i in 1:n){
+    prob[i, 1:K] <- alpha[i, 1:K] / sum(alpha[i, 1:K])
+    
+    y[i, 1:K] ~ dmulti(size = 1, prob = prob[i, 1:K])
+  }
+
+  
+###################  SPECIAL MONITORS ##########################################
+  
+  for (r in 1:R){
+    L2effect[r, 1:K] <- sqrt(((beta[r, 1:K]) ^ 2) / sum((beta[r, 1:K]) ^ 2))
+  }
+
+  for (k in 1:K){
+    L2group[1:R, k]  <- sqrt(((beta[1:R, k]) ^ 2) / sum((beta[1:R, k]) ^ 2))
+  }  
+
+}) 
+```
+
+### 4.2) Constants & Parameters; Run the Model
+```{r nimble_MCMC}
+###################  MODEL PARAMETERS  #########################################
+
+n.sites      <- 60   # Maps to n in nimble code
+n.predictors <- 8    # Maps to R in nimble code
+n.spat_basis <- 35   # Maps to J in nimble code
+n.ref_basis  <- 35   # Maps to Q in nimble code
+n.categories <- 3    # Maps to K in nimble code
+n.bands      <- 10   # Needed for dimension calcs.
+
+
+###################  REFLECTANCE SUMMARY  ######################################
+reflectance_summary <- table(agg_band_data[,1:2])
+reflectance_summary <- colSums(reflectance_summary) / 10
+total_measurement_days <- length(unique(agg_band_data$day_of_year))
+
+summary(reflectance_summary)
+total_measurement_days
+################### X MODEL MATRIX ###################################
+Intercept <- rep(1, n.sites)
+
+model_matrix_X <- cbind(Intercept, NM_locations.df[, c("Elevation", "Slope", "North_Exposure", "East_Exposure", "Heat_Load_Index", "Topo_Position_Index", "Topo_Ruggedness_Index","X","Y")])
+
+model_matrix_X[2:(ncol(model_matrix_X) - 2)] <- scale(model_matrix_X[2:(ncol(model_matrix_X) - 2)])
+
+
+###################  DATAFRAME FOR BASIS EXPANSION  ############################
+head(agg_band_data)
+
+
+###################  SELECT BANDS  #############################################
+sent2_bands
+
+band_select <- c("2", "3", "4", "5", "6", "7", "8", "8A", "11", "12")
+
+band_data_subset <- agg_band_data[agg_band_data$Band %in% band_select, ]
+
+
+###################  SPATIAL PROCESS BASIS EXPANSION ###########################
+H_obj <- smooth.construct(s(X, Y, k = n.spat_basis, fx = T), 
+                      data = model_matrix_X, 
+                      knots = NULL)
+
+H <- H_obj$X
+
+
+###################  REFLECTANCE BASIS EXPANSION ###############################
+G_obj <- smooth.construct(s(day_of_year, Wavelength, k = n.ref_basis, fx = T),
+                      data = band_data_subset,
+                      knots = NULL)
+
+G <- G_obj$X
+
+###############################  LANDCOVER KEY  ################################
+
+landcover_by_site_day_band <- as.integer(band_data_subset$Type)
+
+###############################  RESPONSE MATRIX  ##############################
+
+y_matrix <- matrix(0, nrow = n.sites, ncol = n.categories)
+
+for (i in 1:n.sites){
+  y_matrix[i, NM_locations.df[i,"Type"]] <- as.integer(1)
+}
+
+
+model.constants <- list(# DIMENSION PARAMETERS
+                        n = n.sites, 
+                        R = n.predictors,
+                        J = n.spat_basis,
+                        Q = n.ref_basis,
+                        K = n.categories, 
+                        m_star = dim(G)[1],    # n.sites * n.days * n.bands
+                      
+                        # PRIOR DEFINITIONS
+                        error_var.prior_1 = 0,
+                        error_var.prior_2 = 1, # now logit-scale                  
+                        beta.prior_mean = rep(0, n.predictors),
+                        beta.prior_cov  = diag(n.predictors) * 0.10, 
+                        phi.prior_mean = rep(0, n.categories),
+                        phi.prior_cov = diag(n.categories) * 0.05,
+                        gamma.prior_mean = rep(0, n.categories), 
+                        gamma.prior_cov  = diag(n.categories) * 0.20, 
+                        # HELPERS
+                        k_s_by_measurement = landcover_by_site_day_band)
+
+model.data  <- list(y = y_matrix,
+                    H = H,
+                    G = G,
+                    X = model_matrix_X[, 1:(ncol(model_matrix_X)-2)],
+                    logit_reflectance = logit(band_data_subset$Reflectance))
+
+
+st <- proc.time()
+
+nimble.model <- nimbleModel(code = model.code, 
+                            constants = model.constants,
+                            data = model.data)
+
+
+nimble.config <- configureMCMC(nimble.model, 
+                               monitors = c("alpha", "beta", "gamma", 
+                                             "phi", "prob", "spatial_process", 
+                                             "sigma", "L2group", "L2effect"))
+
+## These slice samplers tend to be more efficient (higher effective sample size), but also significantly slower
+nimble.config$removeSampler("beta")
+nimble.config$addSampler("beta[1:8, 1]", type = "AF_slice")
+nimble.config$addSampler("beta[1:8, 2]", type = "AF_slice")
+nimble.config$addSampler("beta[1:8, 3]", type = "AF_slice")
+
+nimble.config$removeSampler("gamma")
+nimble.config$addSampler("gamma[1:35, 1]", type = "AF_slice")
+nimble.config$addSampler("gamma[1:35, 2]", type = "AF_slice")
+nimble.config$addSampler("gamma[1:35, 3]", type = "AF_slice")
+
+nimble.config$removeSampler("phi")
+nimble.config$addSampler("phi[1:35, 1]", type = "AF_slice")
+nimble.config$addSampler("phi[1:35, 2]", type = "AF_slice")
+nimble.config$addSampler("phi[1:35, 3]", type = "AF_slice")
+                                                      
+nimble.mcmc    <- buildMCMC(nimble.config)
+
+st <- proc.time()
+
+nimble.compiled_model <- compileNimble(nimble.model, showCompilerOutput = F)
+
+nimble.compiled_mcmc  <- compileNimble(nimble.mcmc, project = nimble.model)
+
+
+print("Compilation Duration")
+proc.time() - st
+st <- proc.time()
+
+mcmc.sample         <- runMCMC(nimble.compiled_mcmc, 
+                               niter =  22200, 
+                               nburnin = 2200, 
+                               nchains = 1,
+                               thin = 1,
+                               samplesAsCodaMCMC = TRUE)
+
+print("MCMC Duration")
+proc.time() - st
+
+
+# save(nimble.config, file = paste0(fp_data_obj, "config_file_thesis.Rdata"))
+# save(mcmc.sample, file = paste0(fp_data_obj, "fit.RData"))
+```
+
+### 4.3) Prior Predictive Check
+
+```{r prior_pred_check}
+###################  UNCHANGING MODEL PARAMETERS AND OBJECTS ###############################
+n.sites      <- 60          # Maps to n in nimble code
+n.predictors <- 8           # Maps to R in nimble code
+n.categories <- 3           # Maps to K in nimble code
+n.bands      <- 10          # Needed for dimension calcs.
+
+grid_axis_time <- seq(1, 365, l = 26)
+
+grid_axis_wavelength  <- seq(min(sent2_bands$WAVELENGTH_nm), 
+                             max(sent2_bands$WAVELENGTH_nm), 
+                             l = 20)
+
+time_wavelength_grid <- expand.grid(time = grid_axis_time, 
+                                    wavelength = grid_axis_wavelength)
+
+X_max  <- max(NM_locations.df$X)
+X_min  <- min(NM_locations.df$X)
+Y_max  <- max(NM_locations.df$Y)
+Y_min  <- min(NM_locations.df$Y)
+
+grid_axis_long <- seq(X_min, X_max, l = 20)
+
+grid_axis_lat  <- seq(Y_min, Y_max, l = 20)
+
+longitude_latitude_grid <- expand.grid(X = grid_axis_long, 
+                                       Y = grid_axis_lat) # COLUMN NAMES MUST MATCH ORIGINAL H OBJ
+
+Intercept <- rep(1, n.sites)
+
+model_matrix_X <- cbind(Intercept, 
+                        NM_locations.df[, c("Elevation", "Slope", "North_Exposure", 
+                                            "East_Exposure", "Heat_Load_Index", "Topo_Position_Index", 
+                                            "Topo_Ruggedness_Index","X","Y")])
+
+model_matrix_X[2:(ncol(model_matrix_X) - 2)] <- scale(model_matrix_X[2:(ncol(model_matrix_X) - 2)])
+
+###################  SETTINGS FOR BAD BEHAVIOR  #########################################
+
+# ## bathtub refle values   # Reflectance
+# n.spat_basis.J  <- 20
+# n.ref_basis.Q  <- 20
+# 
+# phi.variance.spat <- 0.01
+# gamma.variance.refl <- 10
+# beta.variance.covar <- 0.01
+# meas_error.variance <- 0.01
+# 
+# ## concentration around reflectances of 0.5 # Reflectance
+# n.spat_basis.J  <- 20
+# n.ref_basis.Q  <- 20
+# 
+# phi.variance.spat <- 0.01
+# gamma.variance.refl <- 0.01
+# beta.variance.covar <- 0.01
+# meas_error.variance <- 0.01
+# 
+# ## "wiggliness" seems to get real bonkers # Reflectance
+# n.spat_basis.J  <- 60
+# n.ref_basis.Q  <- 60
+# 
+# phi.variance.spat <- 0.01
+# gamma.variance.refl <- 1
+# beta.variance.covar <- 0.01
+# meas_error.variance <- 0.01
+# 
+# ## too smooth # Reflectance
+# n.spat_basis.J  <- 10
+# n.ref_basis.Q  <- 10
+# 
+# phi.variance.spat <- 0.01
+# gamma.variance.refl <- 1
+# beta.variance.covar <- 0.01
+# meas_error.variance <- 0.01
+# 
+# ## bathtubbiness (now in the 3-plex sense) # Prob
+# n.spat_basis.J  <- 25
+# n.ref_basis.Q  <- 25
+# 
+# phi.variance.spat <- 10
+# gamma.variance.refl <- 0.15
+# beta.variance.covar <- 0.01
+# meas_error.variance <- 0.01
+# 
+# ## bathtubbiness (now in the 3-plex sense)# Prob
+# n.spat_basis.J  <- 25
+# n.ref_basis.Q  <- 25
+# 
+# phi.variance.spat <- 0.15
+# gamma.variance.refl <- 10    # seems like less sensitivity to high gamma
+# beta.variance.covar <- 0.01
+# meas_error.variance <- 0.01
+
+###################  SETTINGS FOR GOOD BEHAVIOR  ###############################
+# n.spat_basis.J  <- 50  # Reflectance  # Prob
+# n.ref_basis.Q  <- 25  # Reflectance  # Prob
+# 
+# phi.variance.spat <- 0.05  # Reflectance # Prob
+# gamma.variance.refl <- 0.10  # Reflectance # Prob
+# beta.variance.covar <- 0.10  # Reflectance # Prob
+# meas_error.variance <- 0.05  # Reflectance # Prob
+
+n.spat_basis.J  <- 35  # Reflectance  # Prob
+n.ref_basis.Q   <- 35  # Reflectance  # Prob
+
+phi.variance.spat   <- 0.05  # Reflectance # Prob
+gamma.variance.refl <- 0.20  # Reflectance # Prob
+beta.variance.covar <- 0.10  # Reflectance # Prob
+meas_error.variance <- 0.10  # Reflectance # Prob
+
+n.spat_basis.J  <- 50  # Reflectance  # Prob
+n.ref_basis.Q   <- 50  # Reflectance  # Prob
+
+phi.variance.spat   <- 1  # Reflectance # Prob
+gamma.variance.refl <- 1  # Reflectance # Prob
+beta.variance.covar <- 1  # Reflectance # Prob
+meas_error.variance <- 1 # Reflectance # Prob
+
+
+
+###################  VARIABLE MODEL PARAMETERS AND OBJECTS #####################
+G_pp_obj <- smooth.construct(s(time, wavelength, k = n.ref_basis.Q, fx = T),
+                             data = time_wavelength_grid, knots = NULL)
+G_pp <- G_pp_obj$X
+
+
+H_pp_obj <- smooth.construct(s(X, Y, k = n.spat_basis.J, fx = T), 
+                             data = model_matrix_X, knots = NULL)
+H_pp <- H_pp_obj$X
+
+prior_pred.constants <- list(# DIMENSION PARAMETERS
+                             n = n.sites, 
+                             R = n.predictors,
+                             J = n.spat_basis.J,
+                             Q = n.ref_basis.Q,
+                             K = n.categories, 
+                             m_star = dim(G_pp)[1],    # n.sites * n.days * n.bands
+  
+                             # PRIOR DEFINITIONS
+                             error_var.prior_1 = 0,
+                             error_var.prior_2 =  meas_error.variance,
+                             beta.prior_mean = rep(0, n.predictors),
+                             beta.prior_cov  = diag(n.predictors) * beta.variance.covar,
+                             phi.prior_mean = rep(0, n.categories),
+                             phi.prior_cov = diag(n.categories) * phi.variance.spat,
+                             gamma.prior_mean = rep(0, n.categories),
+                             gamma.prior_cov  = diag(n.categories) * gamma.variance.refl,
+                             # HELPERS
+                             k_s_by_measurement = rep(1, dim(G_pp)[1]))
+
+prior_pred.data <- list(H = H_pp,
+                        G = G_pp,
+                        X = model_matrix_X[, 1:(ncol(model_matrix_X)-2)])
+
+
+## build model [no need to compile, things are fast enough without] ----
+prior_pred.model <- nimbleModel(code = model.code, 
+                                constants = prior_pred.constants, 
+                                data = prior_pred.data)
+
+
+
+
+plots_prob <- vector("list", 6)
+# plots_spat1 <- vector("list", 6)
+# plots_spat2 <- vector("list", 6)
+# plots_spat3 <- vector("list", 6)
+
+#### Check measurement error?
+
+prior_pred.model$simulate(c("gamma", "surface", "sigma", "logit_reflectance"))
+
+surface_grid <- matrix(prior_pred.model$surface, 
+                       nrow = length(grid_axis_time), 
+                       ncol = length(grid_axis_wavelength))
+
+reflectance_grid <- matrix(expit(prior_pred.model$logit_reflectance),  
+                           nrow = length(grid_axis_time), 
+                           ncol = length(grid_axis_wavelength))
+
+layout(matrix(1:20, 4, 5))
+for(i in 1:20){
+  plot(grid_axis_time, expit(surface_grid[, i]), type = "l", ylim = 0:1,
+       main = paste("bandwidth", i))
+  points(grid_axis_time, reflectance_grid[, i])
+}
+
+
+for(i in 1:6){ 
+  layout(matrix(1:6, 2, 3))
+  
+  #### Check Reflectance
+  prior_pred.model$simulate(c("gamma", "surface", "sigma", "logit_reflectance"))
+  
+  surface_grid <- matrix(prior_pred.model$surface, 
+                         nrow = length(grid_axis_time), 
+                         ncol = length(grid_axis_wavelength))
+  
+  reflectance_grid <- matrix(expit(prior_pred.model$logit_reflectance),  
+                             nrow = length(grid_axis_time), 
+                             ncol = length(grid_axis_wavelength))
+  
+  image(grid_axis_time, grid_axis_wavelength, surface_grid, main = paste0("true surface ", i," of 6"))
+
+  image(grid_axis_time, grid_axis_wavelength, reflectance_grid, main =  paste0("reflectance ", i," of 6"), 
+         col = hcl.colors(1e2, "Blue-Yellow", rev = T))
+
+  persp(grid_axis_time, grid_axis_wavelength, surface_grid, theta = 50, phi = 25)
+
+  persp(grid_axis_time, grid_axis_wavelength, reflectance_grid, theta = 50, phi = 25)
+  
+  hist(surface_grid)
+
+  hist(reflectance_grid, xlim = 0:1) 
+  
+  #### Check Probability
+  prior_pred.model$simulate(c("beta", "phi", "spatial_process", "alpha", "prob", "y"))
+  
+  layout(matrix(1:3, 1, 3))  
+
+  hist(prior_pred.model$prob, xlim = 0:1, main = paste0("Sim ", i, " Hist. of Probabilities"))
+  
+  barplot(t(prior_pred.model$prob))
+  
+  plots_prob[[i]] <- ggtern(as.data.frame(prior_pred.model$prob), aes(V1, V2, V3)) + geom_point() + ggtitle(paste0("Sim ", i))
+  
+  ##### Check Y
+  y_labels <- apply(prior_pred.model$y == 1, 1, which)
+  
+  plot(model_matrix_X$X, model_matrix_X$Y, col = y_labels, pch = 16, main = paste0("Sim ", i, " Group By Site"))
+  
+  print(paste0("Sim ", i))
+  print(round(table(y_labels) / n.sites, 2))
+
+  #### Check W(S)
+  hold <- Predict.matrix(object = H_pp_obj, data = longitude_latitude_grid)
+  
+  surface_interpol <- Predict.matrix(object = H_pp_obj, data = longitude_latitude_grid) %*% prior_pred.model$phi
+  
+  surface_interpol.grp1 <- matrix(surface_interpol[, 1], nrow = length(grid_axis_long), ncol = length(grid_axis_lat))
+  surface_interpol.grp2 <- matrix(surface_interpol[, 2], nrow = length(grid_axis_long), ncol = length(grid_axis_lat))
+  surface_interpol.grp3 <- matrix(surface_interpol[, 3], nrow = length(grid_axis_long), ncol = length(grid_axis_lat))
+  
+  
+  
+  if(dev.cur() > 1) dev.off()
+  
+  filled.contour(grid_axis_long, grid_axis_lat, surface_interpol.grp1, plot.title = title(main = paste0("Sim ", i, " Grp 1 Spatial Process"), xlab = "Longitude", ylab = "Latitude"), nlevels = 20)
+  filled.contour(grid_axis_long, grid_axis_lat, surface_interpol.grp2, plot.title = title(main = paste0("Sim ", i, " Grp 2 Spatial Process"), xlab = "Longitude", ylab = "Latitude"), nlevels = 20)
+  filled.contour(grid_axis_long, grid_axis_lat, surface_interpol.grp3, plot.title = title(main = paste0("Sim ", i, " Grp 3 Spatial Process"), xlab = "Longitude", ylab = "Latitude"), nlevels = 20)
+  
+  X_beta <- as.matrix(model_matrix_X[, 1:(ncol(model_matrix_X)-2)]) %*% prior_pred.model$beta
+  
+  spatial_process_vals <-prior_pred.model$spatial_process
+  
+  mag.diff <-  abs(spatial_process_vals)/abs(X_beta)
+  
+  par(mfrow = c(1, 3))
+    
+  for (j in 1:ncol(mag.diff)){
+      
+      df <- as.data.frame(cbind(mag.diff[,j], model_matrix_X$X, model_matrix_X$Y))
+  
+      colnames(df) <- c("diff", "longitude", "latitude")
+      
+      spatplot <- ggplot(data = df, aes(x = longitude, y = latitude)) +scale_x_continuous(NULL, expand = c(-0.01, 0.01)) + 
+        scale_y_continuous(NULL, expand = c(-0.01, 0.01)) +  geom_point(aes(fill = mag.diff[,j]), color = "black", pch = 21, size = 2) + scale_fill_gradient2(low = "darkblue", mid = "white", high = "brown", midpoint = 1) + ggtitle(paste0("abs(Spatial)/abs(X*Beta) for Sim ", i, "Grp ", j))
+      print(spatplot)
+  #     if (j == 1){
+  #       plots_spat1[[i]] <- spatplot}
+  #     if (j == 2){
+  #       plots_spat2[[i]] <- spatplot}
+  #     if (j == 3){
+  #       plots_spat3[[i]] <- spatplot}
+  }
+}
+
+# layout(matrix(1:6, 2, 3))
+grid.arrange(arrangeGrob(grobs = plots_prob))
+# grid.arrange(arrangeGrob(grobs = plots_spat1))
+# grid.arrange(arrangeGrob(grobs = plots_spat2))
+# grid.arrange(arrangeGrob(grobs = plots_spat3))
+```
+
+
+```{r illustrate_prior_pred_check, eval = FALSE}
+logit <- function(p) log(p/(1-p))
+
+## compute marginal distribution for p given a vector of covariates and prior sd sigma
+
+f_p <- function(p, sigma, x) dnorm(logit(p), sd = sigma * sum(x^2)) / (p * (1 - p)) 
+
+p_seq <- seq(0.001, 0.999, l = 100)
+
+Ps <- seq(5, 100, by = 5)
+
+best_sigmas <- sapply(Ps, function(P){
+  best_sigma <- optim(par = 2 * P^(-1), fn = function(par){
+    ## repeat for 3e3 different values of x to get MC estimate
+    fs <- sapply(1:3e3, function(iter) f_p(p_seq, par, rnorm(P))) 
+    mean(abs(1 - rowMeans(fs))) ## summarize distance from uniform dist
+  }, method = "Brent", lower = 0, upper = 4/P) ## upper limit is important
+  best_sigma$par
+})
+
+
+## fit 1/P curve
+coef <- coef(lm(best_sigmas ~ I(1/Ps) - 1))
+coef
+plot(Ps, best_sigmas)
+lines(Ps, coef / Ps)
+
+
+## check distribution for specific P
+P <- 60
+fs <- sapply(1:3e3, function(iter) f_p(p_seq, coef / P, rnorm(P)))
+
+
+## these look pretty good to me (we can only get so close with the Gaussian prior)
+plot(p_seq, rowMeans(fs), type = "l", col = "black", ylim = c(0, 1.5))
+```
+
+
+## 5) Arrays of MCMC results
+
+```{r refine_raw_output}
+############################
+### Spatial Data Arrays ####
+
+array_builder(mcmc_output = mcmc.sample, 
+              mcmc_config = nimble.config,
+              n.sites = n.sites, 
+              n.predictors = n.predictors, 
+              n.bands = n.bands, 
+              n.categories = n.categories, 
+              n.basis.refl = n.ref_basis, 
+              n.basis.spat = n.spat_basis)
+
+layout(matrix(1:3), 3, 1)
+apply(mcmc.sample.gamma, 2:3, effectiveSize)
+matplot(mcmc.sample.gamma[, , 3], type = "l")
+apply(mcmc.sample.beta, 2:3, effectiveSize)
+matplot(mcmc.sample.beta[, , 3], type = "l")
+apply(mcmc.sample.phi, 2:3, effectiveSize)
+matplot(mcmc.sample.phi[, , 3], type = "l")
+
+```
+
+### 5.1) Posterior Parameters (Modes, HDR)
+```{r posterior_parameters}
+posterior_params <- posterior_params(mcmc_output = mcmc.sample, 
+                                   mcmc_config = nimble.config, 
+                                     n.sites = n.sites, 
+                                     n.predictors = n.predictors, 
+                                     n.bands = n.bands, 
+                                     n.categories = n.categories, 
+                                     n.basis.refl = n.ref_basis, 
+                                     n.basis.spat = n.spat_basis)
+
+# save(posterior_params, file = paste0(fp_data_obj, "posterior_params_thesis.Rdata"))
+
+# HPDinterval(mcmc.sample[, grep("beta", colnames(mcmc.sample))]) ## HPD interval for beta...
+
+mcmc.sample[1:3, 229:252] # beta
+mcmc.sample[1:3, 253:357] # phi
+
+hold.gamma  <- extract_params(mcmc.sample[, 358:462])
+
+check.gamma1 <- hdr(mcmc.sample[, 358])$mode  # Gamma 1 Group 1
+check.gamma2 <- hdr(mcmc.sample[, 375])$mode  # Gamma 18 Group 1
+check.gamma3 <- hdr(mcmc.sample[, 400])$mode  # Gamma 8 Group 2
+check.gamma4 <- hdr(mcmc.sample[, 425])$mode  # Gamma 33 Group 2
+check.gamma5 <- hdr(mcmc.sample[, 462])$mode  # Gamma 35 Group 3
+
+hold.gamma[1]
+check.gamma1
+posterior_params[["gamma"]][1,1]
+
+hold.gamma[18]
+check.gamma2
+posterior_params[["gamma"]][18,1]
+
+
+hold.gamma[43]
+check.gamma3
+posterior_params[["gamma"]][8,2]
+
+hold.gamma[68]
+check.gamma4
+posterior_params[["gamma"]][33,2]
+
+hold.gamma[105]
+check.gamma5
+posterior_params[["gamma"]][35,3]
+
+```
+
+### 5.2) Check Array and Matrix Creation
+```{r check_arrays, eval=False}
+############################
+### Spatial Data Arrays ####
+
+mcmc.sample[1:3, 1:24]    # L2effect
+mcmc.sample[1:3, 25:48]   # L2group
+mcmc.sample[1:3, 49:228]  # alpha
+mcmc.sample[1:3, 229:252] # beta
+mcmc.sample[1:3, 253:357] # gamma
+mcmc.sample[1:3, 358:462] # phi
+mcmc.sample[1:3, 463:642] # prob
+mcmc.sample[1:3, 643]     # sigma
+mcmc.sample[1:3, 644:823] # spatial
+
+############################
+
+## L2effect check:  X2 GRP 3
+sum(mcmc.sample[, 18])
+sum(mcmc.sample.L2effect[, 2, 3])
+
+hdr(mcmc.sample[, 18])$mode
+hdr(mcmc.sample.L2effect[, 2, 3])$mode
+posterior_params$L2effect[2,3]
+
+## beta check: X5 GRP 1
+sum(mcmc.sample[, 233]) 
+sum(mcmc.sample.beta[, 5, 1])
+
+hdr(mcmc.sample[, 233])$mode
+hdr(mcmc.sample.beta[, 5, 1])$mode
+posterior_params$beta[5,1]
+
+## phi check: Basis 10 GRP 2
+sum(mcmc.sample[, 282]) 
+sum(mcmc.sample.phi[, 10, 2])
+
+hdr(mcmc.sample[, 282])$mode
+hdr(mcmc.sample.phi[, 10, 2])$mode
+posterior_params$phi[10,2]
+
+## gamma check: Basis 28 GRP 3
+sum(mcmc.sample[, 440]) 
+sum(mcmc.sample.gamma[, 28, 3])
+
+hdr(mcmc.sample[, 440])$mode
+hdr(mcmc.sample.gamma[, 28, 3])$mode
+posterior_params$gamma[28,3]
+
+## prob check: Site 50 group 2
+sum(mcmc.sample[, 572])
+sum(mcmc.sample.prob[, 50, 2])
+
+hdr(mcmc.sample[, 572])$mode
+hdr(mcmc.sample.prob[, 50, 2])$mode
+posterior_params$prob[50,2]
+
+## sigma check
+sum(mcmc.sample[, 643])
+sum(mcmc.sample.sigma)
+
+hdr(mcmc.sample[, 643])$mode
+hdr(mcmc.sample.sigma)$mode
+posterior_params$sigma
+
+## spatial check: Site 57 GRP 1
+sum(mcmc.sample[, 700])
+sum(mcmc.sample.spatial_process[,57,1])
+
+hdr(mcmc.sample[, 700])$mode
+hdr(mcmc.sample.spatial_process[,57,1])$mode
+posterior_params$spatial_process[57,1]
+```
+
+## 6) Post-Analysis Visualization
+
+### 6.1) Tail Plots: Correlation of Last 2000 MCMC Iterations
+
+```{r tail_plots, fig.height = 9, fig.width = 16}
+locations <- NM_locations.df[, c("X","Y")]
+  
+tail_plots(mcmc_output_name = "mcmc.sample", 
+           mcmc_config = nimble.config, 
+           observation_locations = locations, 
+           n.sites = n.sites, 
+           n.basis.refl = n.ref_basis, 
+           n.basis.spat = n.spat_basis, 
+           n.categories = n.categories,
+           near.dist = 0.02,
+           far.dist = 0.15)
+```
+
+
+### 6.2) Posterior Convergence Plots
+
+```{r posterior_convergence_plots, fig.height = 12, fig.width = 20}
+posterior_plots(mcmc_output_name = "mcmc.sample", 
+                mcmc_config = nimble.config, 
+                observation_locations = locations, 
+                n.sites = n.sites, 
+                n.predictors = 8,
+                n.basis.refl = n.ref_basis, 
+                n.basis.spat = n.spat_basis, 
+                n.categories = n.categories,
+                near.dist = 0.02,
+                far.dist = 0.15)
+```
+
+
+### 6.3) Probability Curves By Covariate (all iter avg.)
+
+```{r probability_curves_3_groups, fig.height = 26, fig.width = 13}
+# Probability Curves (All Obs)
+#########################################################
+prob_curves_agg(mcmc_output_name = "mcmc.sample", 
+                X_matrix <- model_matrix_X[1:8], 
+                Y_matrix <- y_matrix)
+```
+
+
+### 6.4) Marginal Probability Curves By Covariate
+
+```{r marginal_effect_plots, fig.height = 26, fig.width = 13}
+
+# Probability Curves (Individual Obs)
+#########################################################
+prob_curves_iter(mcmc_output_name = "mcmc.sample", 
+                X_matrix <- model_matrix_X[1:8], 
+                grid_length = 50, 
+                predictors = c("Intercept", "Elevation", "H.L. Index", "T.Pos. Index"))
+
+
+prob_curves_iter(mcmc_output_name = "mcmc.sample", 
+                X_matrix <- model_matrix_X[1:8], 
+                grid_length = 50, 
+                predictors = c("Intercept", "Slope", "N. Exposure", "E. Exposure", "T.Rug. Index"))
+```
+
+#### 6.4.1) Early iteration of marginal plots
+
+```{r marginal_fix_intercept}
+
+###########################################################################################################
+# pdf("~/GitHub/spatial_multinomial/fig/beta_plots.pdf", width = 8.5, height = 11)
+dimnames(mcmc.sample.beta)[[2]] <- colnames(model.data$X)
+
+n_grid <- 100
+
+layout(matrix(1:21, 7, 3, byrow = T))
+
+par(mar = c(0.1, 2, 1.5, 0.5), oma = c(2.5, 0, 1, 2))
+
+for(effect in colnames(model.data$X)[-1]){
+  main <- NULL
+  grid <- seq(-3, 3, l = n_grid)
+  alpha <- sapply(1:3, function(grp) exp(cbind(1, grid) %*% t(mcmc.sample.beta[, c('Intercept', effect), grp])))
+  prob <- array(alpha / rowSums(alpha), dim = c(n_grid, nrow(mcmc.sample.beta), 3))
+  for(k in 1:3){
+    xaxt <- yaxt <- "n"
+    if(effect == colnames(model.data$X)[2]) main <- k
+    if(effect == colnames(model.data$X)[8]) xaxt <- 's'
+    matplot(grid, prob[, sample(1:nrow(mcmc.sample.beta), size = 300), k],
+            type = "l", col = scales::alpha("black", 0.1), lty = 1, ylim = 0:1,
+            main = main, xlab = "x", ylab = "", yaxt = yaxt, xaxt = xaxt, xpd = T)
+    matlines(grid, t(apply(prob[, , k], 1, quantile, probs = c(0.05, 0.5, 0.95))),
+             col = c("darkblue", "black", "darkblue"), lty = c(2, 1, 2), lwd = c(1, 2, 1))
+    if(k == 1) axis(2, 0:1)
+    if(k == 3) mtext(substr(effect, 1, 9), 4, 1)
+  }
+}
+# dev.off()
+```
+
+## 7) Interpolation Surfaces, Prediction, Classification Accuracy
+
+### 7.1) Reflectance Surface
+```{r interpolate_reflectance_surface}
+n_days <- 52
+
+n_bands <- length(unique(agg_band_data$Wavelength))
+
+day_of_year = seq(1, 365, length.out = n_days) 
+
+# Wavelength = sort(unique(agg_band_data$Wavelength)) ## use observed wavelengths
+
+Wavelength <- c(475, 490, 525, 560,    # 490, 560
+                575, 600, 625, 665,    # 665
+                675, 705, 725, 740,    # 705, 740
+                783, 800, 825, 842,    # 783, 842
+                865, 900, 925, 950,    # 865
+                975, 1000, 1025, 1050,
+               1075, 1100, 1125, 1150,
+               1175, 1200, 1225, 1250,
+               1275, 1300, 1325, 1350,
+               1375, 1400, 1425, 1450,
+               1475, 1500, 1525, 1550,
+               1575, 1610, 1625, 1650, # 1610
+               1675, 1700, 1725, 1750,
+               1775, 1800, 1825, 1850,
+               1875, 1900, 1925, 1950,
+               1975, 2000, 2025, 2050,
+               2075, 2100, 2125, 2150,
+               2175, 2190, 2225)       # 2190
+
+Bands <- unique(agg_band_data$Band)[order(unique(agg_band_data$Wavelength))]
+
+reflect_grid <- expand.grid(day_of_year = day_of_year, Wavelength = Wavelength)
+
+reflect_interpol <- expit(Predict.matrix(object = G_obj, data = reflect_grid) %*% posterior_params$gamma)
+
+reflect_interpol.list <- list()
+
+for (i in 1:3){ 
+  reflect_interpol.list[[i]] <- matrix(reflect_interpol[, i], length(day_of_year), length(Wavelength))
+} 
+
+max_reflectance <- max(unlist(lapply(reflect_interpol.list,FUN=max)))
+min_reflectance <- min(unlist(lapply(reflect_interpol.list,FUN=min)))
+
+names(reflect_interpol.list) <- c("Aspen", "Locust", "Oak")
+
+
+par(mar = c(3, 0, 2.5, 0),       
+    cex=1.5,                             
+    tcl = -0.1, 
+    mgp = c(1.8, 0.3,  0),
+    oma = c(0, 4.1, 0, 2))
+
+
+filled.contour(day_of_year, 
+               Wavelength, 
+               reflect_interpol.list[[1]], 
+               plot.title = title(main = "Aspen True Reflectance", 
+               xlab = "Day of year", 
+               ylab = "",
+               cex.main=1.9, 
+               cex.lab=1.5),
+               zlim=range(unlist(reflect_interpol.list)),
+               plot.axes = {axis(1); axis(2); 
+              lines(c(1,365), c(490, 490));
+              lines(c(1,365), c(560, 560));
+              lines(c(1,365), c(665, 665));
+              lines(c(1,365), c(705, 705));
+              lines(c(1,365), c(740, 740));
+              lines(c(1,365), c(783, 783));
+              lines(c(1,365), c(842, 842));
+              lines(c(1,365), c(865, 865));
+              lines(c(1,365), c(1610, 1610));
+              lines(c(1,365), c(2190, 2190))})
+mtext("Central wavelength",side=2,line=2.4,outer=TRUE,cex=1.5,las=0)
+
+
+par(mar = c(3, 0, 2.5, 0),       
+    cex=1.5,                             
+    tcl = -0.1, 
+    mgp = c(1.8, 0.3,  0),
+    oma = c(0, 4.1, 0, 2))
+
+filled.contour(day_of_year, 
+               Wavelength, 
+               reflect_interpol.list[[2]], 
+               plot.title = title(main = "Locust True Reflectance", 
+               xlab = "Day of year", 
+               ylab = "",
+               cex.main=1.9, 
+               cex.lab=1.5),
+               zlim=range(unlist(reflect_interpol.list)),
+               plot.axes = {axis(1); axis(2); 
+              lines(c(1,365), c(490, 490));
+              lines(c(1,365), c(560, 560));
+              lines(c(1,365), c(665, 665));
+              lines(c(1,365), c(705, 705));
+              lines(c(1,365), c(740, 740));
+              lines(c(1,365), c(783, 783));
+              lines(c(1,365), c(842, 842));
+              lines(c(1,365), c(865, 865));
+              lines(c(1,365), c(1610, 1610));
+              lines(c(1,365), c(2190, 2190))})
+mtext("Central wavelength",side=2,line=2.4,outer=TRUE,cex=1.5,las=0)
+
+
+par(mar = c(3, 0, 2.5, 0),       
+    cex=1.5,                             
+    tcl = -0.1, 
+    mgp = c(1.8, 0.3,  0),
+    oma = c(0, 4.1, 0, 2))
+
+filled.contour(day_of_year, 
+               Wavelength, 
+               reflect_interpol.list[[3]], 
+               plot.title = title(main = "Oak True Reflectance", 
+               xlab = "Day of year", 
+               ylab = "",
+               cex.main=1.9, 
+               cex.lab=1.5),
+               zlim=range(unlist(reflect_interpol.list)),
+               plot.axes = {axis(1); axis(2); 
+              lines(c(1,365), c(490, 490));
+              lines(c(1,365), c(560, 560));
+              lines(c(1,365), c(665, 665));
+              lines(c(1,365), c(705, 705));
+              lines(c(1,365), c(740, 740));
+              lines(c(1,365), c(783, 783));
+              lines(c(1,365), c(842, 842));
+              lines(c(1,365), c(865, 865));
+              lines(c(1,365), c(1610, 1610));
+              lines(c(1,365), c(2190, 2190))})
+mtext("Central wavelength",side=2,line=2.4,outer=TRUE,cex=1.5,las=0)
+
+```
+
+#### 7.1.1) By Band, Sample Based
+
+```{r plot_sample_reflectance}
+n_days <- 52
+
+n_bands <- length(unique(agg_band_data$Wavelength))
+
+n_samples <- 2e2
+
+
+day_of_year = seq(1, 365, length.out = n_days) 
+
+Wavelength = sort(unique(agg_band_data$Wavelength)) ## use observed wavelengths
+
+Bands <- unique(agg_band_data$Band)[order(unique(agg_band_data$Wavelength))]
+
+reflect_grid <- expand.grid(day_of_year = day_of_year, Wavelength = Wavelength)
+
+
+## plot to compare inferred reflectance surface with observed values
+G_pred <- Predict.matrix(object = G_obj, data = reflect_grid)
+
+n_samples <- 2e2
+
+sample_surfaces <- array(sapply(sample(1:nrow(mcmc.sample), n_samples), function(iter){
+  expit(G_pred %*% mcmc.sample.gamma[iter, , ])}),
+  dim = c(n_days, n_bands, 3, n_samples))
+
+layout(matrix(1:12, 3, 4))
+
+for(w in Wavelength){
+  colors <- RColorBrewer::brewer.pal(3, "Dark2")
+  plot(range(day_of_year), 0:1, type = "n", xlab = "day", ylab = "reflectance", 
+       main = Bands[which(Wavelength == w)])
+  for(k in 1:3){
+    data <- agg_band_data[agg_band_data$Wavelength == w & agg_band_data$Type == k, ]
+    matplot(day_of_year, sample_surfaces[, which(Wavelength == w), k, ], type = "l", 
+            col = scales::alpha(colors[k], 0.02), lty = 1, add = T)
+    # lines(day_of_year, matrix(reflect_interpol[, k], n_days, n_bands)[, which(Wavelength == w)])
+    points(1:365, sapply(1:365, function(d) median(data[data$day_of_year == d, "Reflectance"])),
+           col = scales::alpha(colors[k], 0.3), cex = 0.7, pch = 16) ## daily medians
+  }
+}
+```
+
+#### 7.1.2) By Band, Mode Based
+```{r interpolate_bands_mode_dim1}
+band_grid <- expand.grid(day_of_year = seq(1, 365, length.out = 52), Wavelength =  sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)])
+
+band_interpol <- Predict.matrix(object = G_obj, data = band_grid) %*% posterior_params$gamma
+
+band_interpol.grp1 <- matrix(expit(band_interpol[, 1]), 52, 10)
+band_interpol.grp2 <- matrix(expit(band_interpol[, 2]), 52, 10)
+band_interpol.grp3 <- matrix(expit(band_interpol[, 3]), 52, 10)
+
+lambdas    <- sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)]
+band_names <-  c("2", "3", "4", "5", "6", "7", "8", "8A", "11", "12")
+
+times <- seq(1, 365, length.out = 52)
+
+## I WANT TO OVERLAY EACH REFLECTANCE BAND WITH THE ACTUAL DAYS OF MEASUREMENT.
+# UNIQUE MEASUREMENT DAYS PER GROUP 
+grp1.obs_days <- unique(agg_band_data[which(agg_band_data$Type == 1), "day_of_year"])
+grp2.obs_days <- unique(agg_band_data[which(agg_band_data$Type == 2), "day_of_year"])
+grp3.obs_days <- unique(agg_band_data[which(agg_band_data$Type == 3), "day_of_year"])
+
+# NEED TO PREDICT THESE VALUES ON ACTUAL DAYS OF MEASUREMENT
+grp1.obs_grid <- expand.grid(day_of_year = grp1.obs_days, Wavelength =  sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)])
+grp2.obs_grid <- expand.grid(day_of_year = grp2.obs_days, Wavelength =  sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)])
+grp3.obs_grid <- expand.grid(day_of_year = grp3.obs_days, Wavelength =  sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)])
+
+# PREDICTING NEEDED VALUES
+grp1.obs_vals <- Predict.matrix(object = G_obj, data = grp1.obs_grid) %*% posterior_params$gamma
+grp2.obs_vals <- Predict.matrix(object = G_obj, data = grp2.obs_grid) %*% posterior_params$gamma
+grp3.obs_vals <- Predict.matrix(object = G_obj, data = grp3.obs_grid) %*% posterior_params$gamma
+
+# LINK FUNCTION FOR OBSERVED REFLECTANCE
+grp1.obs_vals <- matrix(expit(grp1.obs_vals[, 1]), length(grp1.obs_days), 10)
+grp2.obs_vals <- matrix(expit(grp2.obs_vals[, 2]), length(grp2.obs_days), 10)
+grp3.obs_vals <- matrix(expit(grp3.obs_vals[, 3]), length(grp3.obs_days), 10)
+
+# MEASUREMENT DAYS AND BANDS BY PREDICTED REFLECTANCE
+grp1.obs <- as.data.frame(cbind(grp1.obs_days, grp1.obs_vals))
+grp2.obs <- as.data.frame(cbind(grp2.obs_days, grp2.obs_vals))
+grp3.obs <- as.data.frame(cbind(grp3.obs_days, grp3.obs_vals))
+
+# GRID DAYS AND BANDS BY PREDICTED REFLECTANCE FOR TOTAL SURFACE EST.
+grp1.grid_vals <- as.data.frame(cbind(times, band_interpol.grp1))
+grp2.grid_vals <- as.data.frame(cbind(times, band_interpol.grp2))
+grp3.grid_vals <- as.data.frame(cbind(times, band_interpol.grp3))
+
+names(grp1.obs) <- c("day_of_year", band_names)
+names(grp2.obs) <- c("day_of_year", band_names)
+names(grp3.obs) <- c("day_of_year", band_names)
+names(grp1.grid_vals) <- c("day_of_year", band_names)
+names(grp2.grid_vals) <- c("day_of_year", band_names)
+names(grp3.grid_vals) <- c("day_of_year", band_names)
+
+# RESHAPE FOR GGPLOT
+bands.grp1.grid <- reshape::melt(grp1.grid_vals, id = "day_of_year")
+bands.grp2.grid <- reshape::melt(grp2.grid_vals, id = "day_of_year")
+bands.grp3.grid <- reshape::melt(grp3.grid_vals, id = "day_of_year")
+
+predicted.values.list <- list(bands.grp1.grid$value, bands.grp2.grid$value, bands.grp3.grid$value)
+
+pred_range_min <- round_any(min(range(unlist(predicted.values.list))),0.0005, floor)
+
+pred_range_max <- round_any(max(range(unlist(predicted.values.list))),0.0005, ceiling)
+
+bands.grp1.grid$Species <- "Aspen"
+bands.grp2.grid$Species <- "Locust"
+bands.grp3.grid$Species <- "Oak"
+
+bands.allgrps.grid <- rbind(bands.grp1.grid, bands.grp2.grid, bands.grp3.grid)
+
+bands.grp1.obs <- reshape::melt(grp1.obs, id = "day_of_year")
+bands.grp2.obs <- reshape::melt(grp2.obs, id = "day_of_year")
+bands.grp3.obs <- reshape::melt(grp3.obs, id = "day_of_year")
+
+
+##---
+ggplot(data = bands.grp1.grid, aes(day_of_year, value)) +
+  geom_line() + 
+  labs(title= "True Aspen Reflectance By Sent-2 Band", 
+       y = "reflectance", 
+       x = "day of year") + 
+  geom_point(data = bands.grp1.obs, 
+             col = "red", 
+             size = 0.5) + 
+  scale_y_continuous(limits = c(pred_range_min, pred_range_max)) + 
+  facet_wrap(~variable, scales = "free") + 
+  ggthemes::theme_calc() + 
+  theme(axis.line=element_line())
+
+
+ggplot(data = bands.grp2.grid, aes(day_of_year, value)) +
+  geom_line() + 
+  labs(title= "True Locust Reflectance By Sent-2 Band", 
+       y = "reflectance", 
+       x = "day of year") + 
+  geom_point(data = bands.grp2.obs, 
+             col = "blue", 
+             size = 0.5) + 
+  scale_y_continuous(limits = c(pred_range_min, pred_range_max)) + 
+  facet_wrap(~variable, scales = "free") + 
+  ggthemes::theme_calc() + 
+  theme(axis.line=element_line())
+
+ggplot(data = bands.grp3.grid, aes(day_of_year, value)) +
+  geom_line() + 
+  labs(title= "True Oak Reflectance By Sent-2 Band", 
+       y = "reflectance", 
+       x = "day of year") + 
+  geom_point(data = bands.grp3.obs, 
+             col = "purple", 
+             size = 0.5) + 
+  scale_y_continuous(limits = c(pred_range_min, pred_range_max)) + 
+  facet_wrap(~variable, scales = "free") + 
+  ggthemes::theme_calc() + 
+  theme(axis.line=element_line())
+##---
+
+##---
+## MEASUREMENT DAYS VISUALIZATION WASN'T HELPFUL, REMOVING AND STACKING GRAPHIC.
+ggplot(data = bands.allgrps.grid, aes(day_of_year, value, color = Species)) +
+  geom_line(size = 1.0) + 
+  labs(title= "True Reflectance By Sent-2 Band", 
+       y = "reflectance", 
+       x = "day of year") + 
+  scale_y_continuous(limits = c(pred_range_min, pred_range_max)) + 
+  facet_wrap(~variable, scales = "free") + 
+  ggthemes::theme_calc() + 
+  theme(axis.line=element_line())
+
+
+## I WANT TO OVERLAY EACH ESTIMATED REFLECTANCE BAND WITH OBSERVED VALUES
+
+# OBSERVED REFLECTANCE VALUES
+grp1.act <- agg_band_data[which(agg_band_data$Type == 1), c(1,6,8)]
+grp2.act <- agg_band_data[which(agg_band_data$Type == 2), c(1,6,8)]
+grp3.act <- agg_band_data[which(agg_band_data$Type == 3), c(1,6,8)]
+
+names(grp1.act) <- names(bands.grp1.grid)[1:3]
+names(grp2.act) <- names(bands.grp2.grid)[1:3]
+names(grp3.act) <- names(bands.grp3.grid)[1:3]
+
+grp1.act$variable <- factor(grp1.act$variable, 
+                           levels = c("2","3","4","5",
+                                         "6", "7", "8", "8A", "11", "12"))
+
+grp2.act$variable <- factor(grp2.act$variable, 
+                           levels = c("2","3","4","5",
+                                         "6", "7", "8", "8A", "11", "12"))
+
+grp3.act$variable <- factor(grp3.act$variable, 
+                           levels = c("2","3","4","5",
+                                         "6", "7", "8", "8A", "11", "12"))
+
+# ORDER BY DATE JUST IN CASE GGPLOT NEEDS IT THAT WAY
+grp1.act <- grp1.act[order(grp1.act$variable, grp1.act$day_of_year),]
+grp2.act <- grp2.act[order(grp2.act$variable, grp2.act$day_of_year),]
+grp3.act <- grp3.act[order(grp3.act$variable, grp3.act$day_of_year),]
+
+actual.observed.values.list <- list(grp1.act$value, grp2.act$value, grp3.act$value)
+
+print("Range of Observed Reflectance Values")
+range(unlist(actual.observed.values.list))
+
+obs_range_min <- round_any(min(range(unlist(actual.observed.values.list))),0.0005, floor)
+obs_range_max <- round_any(max(range(unlist(actual.observed.values.list))),0.0005, ceiling)
+
+##---
+ggplot(data = bands.grp1.grid, aes(day_of_year, value)) +
+  geom_line() + 
+  labs(title= "True Aspen Reflectance By Sent-2 Band", 
+       y = "reflectance", 
+       x = "day of year") + 
+  geom_point(data = grp1.act, aes(day_of_year, value),
+             col = "red", 
+             size = 0.5, alpha = 0.1, inherit.aes = FALSE) + 
+  scale_y_continuous(limits = c(obs_range_min, obs_range_max)) + 
+  facet_wrap(~variable, scales = "free") + 
+  ggthemes::theme_calc() + 
+  theme(axis.line=element_line())
+
+ggplot(data = bands.grp2.grid, aes(day_of_year, value)) +
+  geom_line() + 
+  labs(title= "True Locust Reflectance By Sent-2 Band", 
+       y = "reflectance", 
+       x = "day of year") + 
+  geom_point(data = grp2.act, aes(day_of_year, value),
+             col = "blue", 
+             size = 0.5, alpha = 0.1, inherit.aes = FALSE) + 
+  scale_y_continuous(limits = c(obs_range_min, obs_range_max)) + 
+  facet_wrap(~variable, scales = "free") + 
+  ggthemes::theme_calc() + 
+  theme(axis.line=element_line())
+
+ggplot(data = bands.grp3.grid, aes(day_of_year, value)) +
+  geom_line() + 
+  labs(title= "True Oak Reflectance By Sent-2 Band", 
+       y = "reflectance", 
+       x = "day of year") + 
+  geom_point(data = grp3.act, aes(day_of_year, value),
+             col = "purple", 
+             size = 0.5, alpha = 0.1, inherit.aes = FALSE) + 
+  scale_y_continuous(limits = c(obs_range_min, obs_range_max)) + 
+  facet_wrap(~variable, scales = "free") + 
+  ggthemes::theme_calc() + 
+  theme(axis.line=element_line())
+##---
+```
+
+
+#### 7.1.3) By Equinox-Solstice, Mode Based
+```{r interpolate_days_mode_dim2}
+day_of_year <- c(80, 172, 267, 356)
+
+Wavelength <- c(475, 490, 525, 560,    # 490, 560
+                575, 600, 625, 665,    # 665
+                675, 705, 725, 740,    # 705, 740
+                783, 800, 825, 842,    # 783, 842
+                865, 900, 925, 950,    # 865
+                975, 1000, 1025, 1050,
+               1075, 1100, 1125, 1150,
+               1175, 1200, 1225, 1250,
+               1275, 1300, 1325, 1350,
+               1375, 1400, 1425, 1450,
+               1475, 1500, 1525, 1550,
+               1575, 1610, 1625, 1650, # 1610
+               1675, 1700, 1725, 1750,
+               1775, 1800, 1825, 1850,
+               1875, 1900, 1925, 1950,
+               1975, 2000, 2025, 2050,
+               2075, 2100, 2125, 2150,
+               2175, 2190, 2225)       # 2190
+
+# Wavelength <- sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)]
+
+day_wave_grid <- expand.grid(day_of_year = day_of_year, Wavelength = Wavelength)
+
+day_wave_interpol <- Predict.matrix(object = G_obj, data = day_wave_grid) %*% posterior_params$gamma
+
+day_wave_interpol.grp1 <- matrix(expit(day_wave_interpol[, 1]), length(day_of_year), length(Wavelength))
+day_wave_interpol.grp2 <- matrix(expit(day_wave_interpol[, 2]), length(day_of_year), length(Wavelength))
+day_wave_interpol.grp3 <- matrix(expit(day_wave_interpol[, 3]), length(day_of_year), length(Wavelength))
+
+day_wave_interpol.grp1 <- as.data.frame(t(day_wave_interpol.grp1))
+day_wave_interpol.grp2 <- as.data.frame(t(day_wave_interpol.grp2))
+day_wave_interpol.grp3 <- as.data.frame(t(day_wave_interpol.grp3))
+
+names(day_wave_interpol.grp1) <- names(day_wave_interpol.grp2) <- names(day_wave_interpol.grp3) <- c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice")
+
+day_wave_interpol.grp1$Wavelength <- day_wave_interpol.grp2$Wavelength <- day_wave_interpol.grp3$Wavelength <- Wavelength
+
+day_wave_interpol.grp1$Species <- "Aspen"
+day_wave_interpol.grp2$Species <- "Locust"
+day_wave_interpol.grp3$Species <- "Oak"
+
+day_wave_interpol.all <- rbind(day_wave_interpol.grp1, day_wave_interpol.grp2, day_wave_interpol.grp3)
+
+day_wave_interpol.all <- reshape::melt(day_wave_interpol.all, id = c("Wavelength", "Species"))
+
+names(day_wave_interpol.all) <- c("Wavelength", "Species", "Event", "Reflectance")
+
+day_wave_interpol.all$Species <- factor(day_wave_interpol.all$Species, ordered = T, 
+                           levels = c("Aspen","Locust","Oak"))
+
+day_wave_interpol.all$Event <- factor(day_wave_interpol.all$Event, 
+                           levels = c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice"))
+
+
+ggplot(data = day_wave_interpol.all, aes(Wavelength, Reflectance, color = Species)) +
+  geom_line() + 
+  labs(title= "True Reflectance By Seasonal Event", 
+       y = "reflectance", 
+       x = "wavelength") + 
+  facet_wrap(~Event) + 
+  ggthemes::theme_calc() + 
+  theme(axis.line=element_line())
+```
+#### 7.1.4) By Equinox-Solstice, With Uncertainty
+```{r uncertainty_days_dim2}
+n_samples <- 2500
+
+event_days <- c(80, 172, 267, 356)
+
+Wavelength <- c(475, 490, 525, 560,    # 490, 560
+                575, 600, 625, 665,    # 665
+                675, 705, 725, 740,    # 705, 740
+                783, 800, 825, 842,    # 783, 842
+                865, 900, 925, 950,    # 865
+                975, 1000, 1025, 1050,
+               1075, 1100, 1125, 1150,
+               1175, 1200, 1225, 1250,
+               1275, 1300, 1325, 1350,
+               1375, 1400, 1425, 1450,
+               1475, 1500, 1525, 1550,
+               1575, 1610, 1625, 1650, # 1610
+               1675, 1700, 1725, 1750,
+               1775, 1800, 1825, 1850,
+               1875, 1900, 1925, 1950,
+               1975, 2000, 2025, 2050,
+               2075, 2100, 2125, 2150,
+               2175, 2190, 2225)       # 2190
+
+day_wave_grid <- expand.grid(day_of_year = event_days, Wavelength = Wavelength)
+
+G_pred <- Predict.matrix(object = G_obj, data = day_wave_grid)
+
+sample_surfaces <- array(
+  sapply(sample(1:nrow(mcmc.sample), n_samples), function(iter){expit(G_pred %*% mcmc.sample.gamma[iter, , ])}),
+  dim = c(length(event_days),length(Wavelength), 3, n_samples))
+
+array_dim_names <- list(c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice"),
+                   as.character(Wavelength),
+                   c("Aspen", "Locust", "Oak"))
+
+lower_bounds <-  array(NA, dim = c(length(event_days), length(Wavelength), 3), dimnames = array_dim_names)
+upper_bounds <-  array(NA, dim = c(length(event_days), length(Wavelength), 3), dimnames = array_dim_names)
+median_line  <-  array(NA, dim = c(length(event_days), length(Wavelength), 3), dimnames = array_dim_names)
+
+
+for (day in 1:length(event_days)){ 
+  for (wav in 1:length(Wavelength)){ 
+    for (grp in 1:3){ 
+      lower_bounds[day,wav,grp] <- quantile(sample_surfaces[day,wav,grp, ], 0.025)
+      upper_bounds[day,wav,grp] <- quantile(sample_surfaces[day,wav,grp, ], 0.975)
+      median_line[day,wav,grp]  <- median(sample_surfaces[day,wav,grp, ]) 
+      }}}
+
+lower_bounds_a <- as.data.frame(lower_bounds[,,1]) 
+lower_bounds_l <- as.data.frame(lower_bounds[,,2])
+lower_bounds_o <- as.data.frame(lower_bounds[,,3])
+ 
+lower_bounds_a$Event <- lower_bounds_l$Event <- lower_bounds_o$Event <- c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice")
+
+lower_bounds_a$Species <- "Aspen"
+lower_bounds_l$Species <- "Locust"
+lower_bounds_o$Species <- "Oak"
+
+lb_reshape_a <- reshape::melt(lower_bounds_a, id = c("Event", "Species"))
+lb_reshape_l <- reshape::melt(lower_bounds_l, id = c("Event", "Species"))
+lb_reshape_o <- reshape::melt(lower_bounds_o, id = c("Event", "Species"))
+
+lb_reshape_a$Bound <- lb_reshape_l$Bound <- lb_reshape_o$Bound <- "0.025"
+lb_reshape_a$Median <- lb_reshape_l$Median <- lb_reshape_o$Median <- NA
+
+upper_bounds_a <- as.data.frame(upper_bounds[,,1]) 
+upper_bounds_l <- as.data.frame(upper_bounds[,,2])
+upper_bounds_o <- as.data.frame(upper_bounds[,,3])
+
+upper_bounds_a$Event <- upper_bounds_l$Event <- upper_bounds_o$Event <- c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice")
+
+upper_bounds_a$Species <- "Aspen"
+upper_bounds_l$Species <- "Locust"
+upper_bounds_o$Species <- "Oak"
+
+ub_reshape_a <- reshape::melt(upper_bounds_a, id = c("Event", "Species"))
+ub_reshape_l <- reshape::melt(upper_bounds_l, id = c("Event", "Species"))
+ub_reshape_o <- reshape::melt(upper_bounds_o, id = c("Event", "Species"))
+
+ub_reshape_a$Bound <- ub_reshape_l$Bound <- ub_reshape_o$Bound <- "0.975"
+ub_reshape_a$Median <- ub_reshape_l$Median <- ub_reshape_o$Median <- NA
+
+median_line_a <- as.data.frame(median_line[,,1]) 
+median_line_l <- as.data.frame(median_line[,,2])
+median_line_o <- as.data.frame(median_line[,,3])
+
+median_line_a$Event <- median_line_l$Event <- median_line_o$Event <-c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice")
+
+median_line_a$Species <- "Aspen"
+median_line_l$Species <- "Locust"
+median_line_o$Species <- "Oak"
+
+med_reshape_a <- reshape::melt(median_line_a, id = c("Event", "Species"))
+med_reshape_l <- reshape::melt(median_line_l, id = c("Event", "Species"))
+med_reshape_o <- reshape::melt(median_line_o, id = c("Event", "Species"))
+
+med_reshape_a$Bound <- med_reshape_l$Bound <- med_reshape_o$Bound <- NA
+med_reshape_a$Median <- med_reshape_l$Median <- med_reshape_o$Median <- "Median"
+
+bounds_df <- rbind(lb_reshape_a, lb_reshape_l, lb_reshape_o, ub_reshape_a,ub_reshape_l,ub_reshape_o, med_reshape_a, med_reshape_l, med_reshape_o)
+
+names(bounds_df) <-  c("Event", "Species", "Wavelength", "Reflectance", "Bound", "Median")
+
+bounds_df$Wavelength <- as.numeric(as.character(bounds_df$Wavelength))
+
+bounds_df$Event <- factor(bounds_df$Event, ordered = T, 
+                           levels = c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice"))
+
+
+bounds_df$Species <- factor(bounds_df$Species, ordered = T, 
+                           levels = c("Aspen","Locust","Oak"))
+
+bounds_df$Bound <- as.character(bounds_df$Bound)
+
+bounds_df$Bound <- factor(bounds_df$Bound, ordered = T, 
+                           levels = c("0.025","0.975"))
+
+bounds_df$Median <- factor(bounds_df$Median, levels = c("Median"))
+
+ggplot(data = bounds_df, aes(Wavelength, Reflectance)) +
+  geom_line(data = bounds_df[which(bounds_df$Median == "Median"), ], aes(Wavelength, Reflectance), inherit.aes = F) + 
+  geom_line(data = bounds_df[which(!is.na(bounds_df$Bound)),], aes(Wavelength, Reflectance, group = Bound), color = "red", linetype = "dashed", inherit.aes = F) + 
+  labs(title= "True Reflectance By Seasonal Event With Uncertainty", 
+       y = "reflectance", 
+       x = "wavelength") + 
+  facet_nested_wrap(~Event + Species, axes = "all", remove_labels = "all", nrow = 4, ncol = 3) + 
+  ggthemes::theme_calc() + 
+  theme(axis.line=element_line())
+
+hold <- bounds_df[which(!is.na(bounds_df$Bound)), ]
+ribbon_lb <- hold[which(hold$Bound == "0.025"), ]
+ribbon_ub <- hold[which(hold$Bound == "0.975"), ]
+
+ribbon_lb <- ribbon_lb[1:4]
+ribbon_ub <- ribbon_ub[1:4]
+
+names(ribbon_lb) <- c("Event", "Species", "Wavelength", "lb")
+names(ribbon_ub) <- c("Event", "Species", "Wavelength", "ub")
+
+ribbon <- left_join(ribbon_lb, ribbon_ub, by = c("Event", "Species", "Wavelength"))
+
+
+ggplot(data = bounds_df, aes(Wavelength, Reflectance)) +
+  geom_ribbon(data = ribbon, aes(x = Wavelength, ymin = lb, ymax = ub), fill = "red", alpha = 0.25, inherit.aes = F) + 
+  geom_line(data = bounds_df[which(bounds_df$Median == "Median"), ], aes(Wavelength, Reflectance), size = 1, inherit.aes = F) + 
+  geom_vline(xintercept = sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)]) + 
+  labs(title= "True Reflectance By Seasonal Event With Uncertainty", 
+       y = "reflectance", 
+       x = "wavelength") + 
+  facet_nested_wrap(~Event + Species, axes = "all", remove_labels = "all", nrow = 4, ncol = 3) + 
+  ggthemes::theme_calc() + 
+  theme(text = element_text(size = 24),
+        panel.spacing = unit(.1, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, size = 2), 
+        strip.background = element_rect(color = "black", size = 2))+
+  theme(axis.line=element_line())
+```
+
+####7.1.5) By Band With Uncertainty
+```{r uncertainty_bands_dim1}
+n_days <- 52
+
+n_samples <- 2500
+
+day_of_year = seq(1, 365, length.out = n_days) 
+
+Wavelength <- sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)]
+
+
+band_names <-  c("2", "3", "4", "5", "6", "7", "8", "8A", "11", "12")
+species_names <- c("Aspen", "Locust", "Oak")
+
+reflect_grid <- expand.grid(day_of_year = day_of_year, Wavelength = Wavelength)
+
+## plot to compare inferred reflectance surface with observed values
+G_pred <- Predict.matrix(object = G_obj, data = reflect_grid)
+
+
+sample_surfaces <- array(
+  sapply(sample(1:nrow(mcmc.sample), n_samples), function(iter){expit(G_pred %*% mcmc.sample.gamma[iter, , ])}),
+  dim = c(length(day_of_year),length(Wavelength), 3, n_samples))
+
+
+array_dim_names <- list(paste0("Week ", 1:52),
+                   band_names,
+                   c("Aspen", "Locust", "Oak"))
+
+lower_bounds <-  array(NA, dim = c(length(day_of_year), length(Wavelength), 3), dimnames = array_dim_names)
+upper_bounds <-  array(NA, dim = c(length(day_of_year), length(Wavelength), 3), dimnames = array_dim_names)
+median_line  <-  array(NA, dim = c(length(day_of_year), length(Wavelength), 3), dimnames = array_dim_names)
+
+
+for (day in 1:length(day_of_year)){ 
+  for (band in 1:length(Wavelength)){ 
+    for (grp in 1:3){ 
+      lower_bounds[day,band,grp] <- quantile(sample_surfaces[day,band,grp, ], 0.025)
+      upper_bounds[day,band,grp] <- quantile(sample_surfaces[day,band,grp, ], 0.975)
+      median_line[day,band,grp]  <- median(sample_surfaces[day,band,grp, ]) 
+      }}}
+
+lower_bounds_a <- as.data.frame(lower_bounds[,,1]) 
+lower_bounds_l <- as.data.frame(lower_bounds[,,2])
+lower_bounds_o <- as.data.frame(lower_bounds[,,3])
+ 
+lower_bounds_a$day_of_year <- lower_bounds_l$day_of_year <- lower_bounds_o$day_of_year <- day_of_year
+
+lower_bounds_a$Species <- "Aspen"
+lower_bounds_l$Species <- "Locust"
+lower_bounds_o$Species <- "Oak"
+
+lb_reshape_a <- reshape::melt(lower_bounds_a, id = c("day_of_year", "Species"))
+lb_reshape_l <- reshape::melt(lower_bounds_l, id = c("day_of_year", "Species"))
+lb_reshape_o <- reshape::melt(lower_bounds_o, id = c("day_of_year", "Species"))
+
+lb_reshape_a$Bound <- lb_reshape_l$Bound <- lb_reshape_o$Bound <- "0.025"
+lb_reshape_a$Median <- lb_reshape_l$Median <- lb_reshape_o$Median <- NA
+
+upper_bounds_a <- as.data.frame(upper_bounds[,,1]) 
+upper_bounds_l <- as.data.frame(upper_bounds[,,2])
+upper_bounds_o <- as.data.frame(upper_bounds[,,3])
+
+upper_bounds_a$day_of_year <- upper_bounds_l$day_of_year <- upper_bounds_o$day_of_year <- day_of_year
+
+upper_bounds_a$Species <- "Aspen"
+upper_bounds_l$Species <- "Locust"
+upper_bounds_o$Species <- "Oak"
+
+ub_reshape_a <- reshape::melt(upper_bounds_a, id = c("day_of_year", "Species"))
+ub_reshape_l <- reshape::melt(upper_bounds_l, id = c("day_of_year", "Species"))
+ub_reshape_o <- reshape::melt(upper_bounds_o, id = c("day_of_year", "Species"))
+
+ub_reshape_a$Bound <- ub_reshape_l$Bound <- ub_reshape_o$Bound <- "0.975"
+ub_reshape_a$Median <- ub_reshape_l$Median <- ub_reshape_o$Median <- NA
+
+median_line_a <- as.data.frame(median_line[,,1]) 
+median_line_l <- as.data.frame(median_line[,,2])
+median_line_o <- as.data.frame(median_line[,,3])
+
+median_line_a$day_of_year <- median_line_l$day_of_year <- median_line_o$day_of_year <- day_of_year
+
+median_line_a$Species <- "Aspen"
+median_line_l$Species <- "Locust"
+median_line_o$Species <- "Oak"
+
+med_reshape_a <- reshape::melt(median_line_a, id = c("day_of_year", "Species"))
+med_reshape_l <- reshape::melt(median_line_l, id = c("day_of_year", "Species"))
+med_reshape_o <- reshape::melt(median_line_o, id = c("day_of_year", "Species"))
+
+med_reshape_a$Bound <- med_reshape_l$Bound <- med_reshape_o$Bound <- NA
+med_reshape_a$Median <- med_reshape_l$Median <- med_reshape_o$Median <- "Median"
+
+bounds_df <- rbind(lb_reshape_a, lb_reshape_l, lb_reshape_o, ub_reshape_a,ub_reshape_l,ub_reshape_o, med_reshape_a, med_reshape_l, med_reshape_o)
+
+names(bounds_df) <-  c("day_of_year", "Species", "Band", "Reflectance", "Bound", "Median")
+
+bounds_df$Band <- factor(bounds_df$Band, ordered = T, 
+                           levels = c("1","2","3","4","5",
+                                         "6", "7", "8", "8A", "9",
+                                         "10", "11", "12"))
+
+
+bounds_df$Species <- factor(bounds_df$Species, ordered = T, 
+                           levels = c("Aspen","Locust","Oak"))
+
+bounds_df$Bound <- as.character(bounds_df$Bound)
+
+bounds_df$Bound <- factor(bounds_df$Bound, ordered = T, 
+                           levels = c("0.025","0.975"))
+
+# bounds_df$Median <- NA
+# bounds_df[which(bounds_df$Bound == "0.500"), "Median"] <- "Median"
+bounds_df$Median <- factor(bounds_df$Median, levels = c("Median")) 
+
+ggplot(data = bounds_df, aes(day_of_year, Reflectance)) +
+  geom_line(data = bounds_df[which(bounds_df$Median == "Median"), ], aes(day_of_year, Reflectance), inherit.aes = F) + 
+  geom_line(data = bounds_df[which(!is.na(bounds_df$Bound)),], aes(day_of_year, Reflectance, group = Bound), color = "red", linetype = "dashed", inherit.aes = F) + 
+  labs(title= "True Reflectance By Sent-2 Band With Uncertainty", 
+       y = "reflectance", 
+       x = "day of year") + 
+  facet_nested_wrap(~Band + Species) + 
+  ggthemes::theme_calc() + 
+  theme(axis.line=element_line())
+```
+
+
+### 7.2) Spatial Surface
+```{r interpolate_w}
+X_max  <- max(NM_locations.df$X)
+X_min  <- min(NM_locations.df$X)
+Y_max  <- max(NM_locations.df$Y)
+Y_min  <- min(NM_locations.df$Y)
+
+X_max  <- max(study_area_poly[[1]][[1]][,1])
+X_min  <- min(study_area_poly[[1]][[1]][,1])
+Y_max  <- max(study_area_poly[[1]][[1]][,2])
+Y_min  <- min(study_area_poly[[1]][[1]][,2])
+
+X_max  <- -106.28
+X_min  <- -106.63
+Y_max  <- 35.91
+Y_min  <- 35.75
+
+
+long_grid <- seq(X_min, X_max, length.out = 125)
+lat_grid  <- seq(Y_min, Y_max, length.out = 125)
+
+spat_grid <- expand.grid(X = long_grid, Y = lat_grid)
+
+spat_interpol <- Predict.matrix(object = H_obj, data = spat_grid) %*% posterior_params$phi
+
+
+spat_interpol.list <- list()
+
+for (i in 1:3){ 
+spat_interpol.list[[i]] <- matrix(spat_interpol[, i], 125, 125)
+} 
+
+names(spat_interpol.list) <- c("Aspen", "Locust", "Oak")
+
+
+cols <- c("#00876c", "#4c9c85", "#78b19f", "#a0c6b9", "#c8dbd5", "#f1f1f1", "#f1cfce", "#eeadad", "#e88b8d", "#df676e", "#d43d51")
+
+colpal <- colorRampPalette(rev(cols))
+
+
+par(mar = c(3, 0, 2.5, 0),       
+    cex=1.5,                             
+    tcl = -0.1, 
+    mgp = c(1.8, 0.3,  0),
+    oma = c(0, 4.1, 0, 2))
+
+filled.contour(long_grid, 
+               lat_grid, 
+               spat_interpol.list[[1]], 
+               zlim=range(unlist(spat_interpol.list)), 
+               color.palette =  colpal,
+               plot.title = title(main = "Aspen Spatial Process", xlab = "Longitude", ylab = "", cex.main=1.9, cex.lab=1.5),
+               plot.axes ={
+                 points(NM_locations.df[which(NM_locations.df$Type==1),"X"],
+                        NM_locations.df[which(NM_locations.df$Type==1),"Y"], 
+                        col="darkred", 
+                        pch="A")
+                 points(NM_locations.df[which(NM_locations.df$Type==2),"X"],
+                        NM_locations.df[which(NM_locations.df$Type==2),"Y"], 
+                        col="grey12", 
+                        pch="L")  
+                 points(NM_locations.df[which(NM_locations.df$Type==3),"X"],
+                        NM_locations.df[which(NM_locations.df$Type==3),"Y"],
+                        col="grey12",
+                        pch="O")
+                 axis(side=1)
+                 axis(side=2)}
+               )
+mtext("Latitude",side=2,line=2.4,outer=TRUE,cex=1.5,las=0)
+
+
+
+par(mar = c(3, 0, 2.5, 0),       
+    cex=1.5,                             
+    tcl = -0.1, 
+    mgp = c(1.8, 0.3,  0),
+    oma = c(0, 4.1, 0, 2))
+
+filled.contour(long_grid, 
+               lat_grid, 
+               spat_interpol.list[[2]], 
+               zlim=range(unlist(spat_interpol.list)), 
+               color.palette = colpal,
+               plot.title = title(main = "Locust Spatial Process", xlab = "Longitude", ylab = "", cex.main=1.9, cex.lab=1.5),
+               plot.axes ={
+                 points(NM_locations.df[which(NM_locations.df$Type==1),"X"],
+                        NM_locations.df[which(NM_locations.df$Type==1),"Y"], 
+                        col="grey12", 
+                        pch="A")
+                 points(NM_locations.df[which(NM_locations.df$Type==2),"X"],
+                        NM_locations.df[which(NM_locations.df$Type==2),"Y"], 
+                        col="darkred", 
+                        pch="L")  
+                 points(NM_locations.df[which(NM_locations.df$Type==3),"X"],
+                        NM_locations.df[which(NM_locations.df$Type==3),"Y"],
+                        col="grey12",
+                        pch="O")
+                 axis(side=1)
+                 axis(side=2)}
+               )
+mtext("Latitude",side=2,line=2.4,outer=TRUE,cex=1.5,las=0)
+
+
+
+par(mar = c(3, 0, 2.5, 0),       
+    cex=1.5,                             
+    tcl = -0.1, 
+    mgp = c(1.8, 0.3,  0),
+    oma = c(0, 4.1, 0, 2))
+
+filled.contour(long_grid, 
+               lat_grid, 
+               spat_interpol.list[[3]], 
+               zlim=range(unlist(spat_interpol.list)), 
+               color.palette = colpal,
+               plot.title = title(main = "Oak Spatial Process", xlab = "Longitude", ylab = "", cex.main=1.9, cex.lab=1.5),
+               plot.axes = {
+                 points(NM_locations.df[which(NM_locations.df$Type==1),"X"],
+                        NM_locations.df[which(NM_locations.df$Type==1),"Y"], 
+                        col="grey12", 
+                        pch="A")
+                 points(NM_locations.df[which(NM_locations.df$Type==2),"X"],
+                        NM_locations.df[which(NM_locations.df$Type==2),"Y"], 
+                        col="grey12", 
+                        pch="L")  
+                 points(NM_locations.df[which(NM_locations.df$Type==3),"X"],
+                        NM_locations.df[which(NM_locations.df$Type==3),"Y"],
+                        col="darkred",
+                        pch="O")
+                 axis(side=1)
+                 axis(side=2)}
+               )
+mtext("Latitude",side=2,line=2.4,outer=TRUE,cex=1.5,las=0)
+
+
+
+```
+## 8) Thesis Plots
+
+
+### 8.0) Random facts related to distance, days of measurement
+```{r fact_finder}
+
+NM_locations.sf <- read_sf(dsn = paste0(fp_data_obj, "KSU"), layer = "NM_ID_Points")
+
+NM_locations.sf <- st_transform(NM_locations.sf, proj4string = "+init=epsg:32613")
+
+NM_locations.sf$Comment <- factor(NM_locations.sf$Comment, ordered = T, 
+                           levels = c("Aspen","Locust","Oak"))
+
+aspen_dist  <- list()
+locust_dist <- list()
+oak_dist    <- list()
+all_dist    <- list()
+
+aspen_locs.sf  <- NM_locations.sf[NM_locations.sf$Comment == "Aspen",]
+locust_locs.sf <- NM_locations.sf[NM_locations.sf$Comment == "Locust",]
+oak_locs.sf    <- NM_locations.sf[NM_locations.sf$Comment == "Oak",]
+
+for (i in 1:60){
+  hold1 <- st_distance(aspen_locs.sf[i,],aspen_locs.sf, by_element = T)
+  hold2 <- st_distance(locust_locs.sf[i,],locust_locs.sf, by_element = T)
+  hold3 <- st_distance(oak_locs.sf[i,],oak_locs.sf, by_element = T)
+  hold4 <- st_distance(NM_locations.sf[i,],NM_locations.sf, by_element = T)
+  aspen_dist[[i]]  <- hold1[!is.na(hold1)]
+  locust_dist[[i]] <- hold2[!is.na(hold2)]
+  oak_dist[[i]]    <- hold3[!is.na(hold3)]
+  all_dist[[i]]    <- hold4[!is.na(hold3)]
+  }
+
+## intra-class
+
+aspen_dist_all <- unlist(aspen_dist)
+aspen_dist_all <- aspen_dist_all[!aspen_dist_all == 0]
+aspen_dist_all <- unique(aspen_dist_all)
+
+locust_dist_all <- unlist(locust_dist)
+locust_dist_all <- locust_dist_all[!locust_dist_all == 0]
+locust_dist_all <- unique(locust_dist_all)
+
+oak_dist_all <- unlist(oak_dist)
+oak_dist_all <- oak_dist_all[!oak_dist_all == 0]
+oak_dist_all <- unique(oak_dist_all)
+
+min(aspen_dist_all)
+max(aspen_dist_all)
+mean(aspen_dist_all)
+median(aspen_dist_all)
+
+
+min(locust_dist_all)
+max(locust_dist_all)
+mean(locust_dist_all)
+median(locust_dist_all)
+
+
+## among all
+aspen_dist  <- list()
+
+locust_dist <- list()
+
+oak_dist    <- list()
+
+for (i in 1:60){
+  hold1 <- st_distance(aspen_locs.sf[i,],NM_locations.sf, by_element = T)
+  hold2 <- st_distance(locust_locs.sf[i,],NM_locations.sf, by_element = T)
+  hold3 <- st_distance(oak_locs.sf[i,],NM_locations.sf, by_element = T)
+  aspen_dist[[i]]  <- hold1[!is.na(hold1)]
+  locust_dist[[i]] <- hold2[!is.na(hold2)]
+  oak_dist[[i]]    <- hold3[!is.na(hold3)]
+  }
+
+aspen_dist_all <- unlist(aspen_dist)
+aspen_dist_all <- aspen_dist_all[!aspen_dist_all == 0]
+aspen_dist_all <- unique(aspen_dist_all)
+
+locust_dist_all <- unlist(locust_dist)
+locust_dist_all <- locust_dist_all[!locust_dist_all == 0]
+locust_dist_all <- unique(locust_dist_all)
+
+oak_dist_all <- unlist(oak_dist)
+oak_dist_all <- oak_dist_all[!oak_dist_all == 0]
+oak_dist_all <- unique(oak_dist_all)
+
+min(aspen_dist_all)
+max(aspen_dist_all)
+mean(aspen_dist_all)
+median(aspen_dist_all)
+
+min(locust_dist_all)
+max(locust_dist_all)
+mean(locust_dist_all)
+median(locust_dist_all)
+
+min(oak_dist_all)
+max(oak_dist_all)
+mean(oak_dist_all)
+median(oak_dist_all)
+
+##
+
+all_dist_all <- unlist(all_dist)
+all_dist_all <- all_dist_all[!all_dist_all == 0]
+all_dist_all <- unique(all_dist_all)
+
+aspen_dist_all[aspen_dist_all < 50]
+locust_dist_all[locust_dist_all < 50]
+oak_dist_all[oak_dist_all < 50]
+all_dist_all[all_dist_all < 20]
+
+hold <- table(agg_band_data[,1:2])
+
+hold <- as.data.frame(hold)
+
+hold <- as.data.frame(table(hold[!hold$Freq == 0,1:2]))
+
+hold <- hold[!hold$Freq == 0, 1:2]
+
+table(hold$day_of_year)
+
+days_aspen <- unique(agg_band_data[agg_band_data$Type == 1, "day_of_year"])
+days_locust <- unique(agg_band_data[agg_band_data$Type == 2, "day_of_year"])
+days_oak <- unique(agg_band_data[agg_band_data$Type == 3, "day_of_year"])
+
+hold <- table(c(days_aspen, days_locust, days_oak))
+hold[hold<3]
+
+days_all <- unique(c(days_aspen, days_locust, days_oak))
+
+
+hold1 <- numeric(0)
+hold2 <- numeric(0)
+hold3 <- numeric(0)
+
+for (i in 2:length(days_oak)){
+  hold1[i-1] <- days_aspen[i] - days_aspen[i-1]
+  hold2[i-1] <- days_locust[i] - days_locust[i-1]
+  hold3[i-1] <- days_oak[i] - days_oak[i-1]
+}
+
+mean(hold1, na.rm = T)
+mean(hold2, na.rm = T)
+mean(hold3, na.rm = T)
+
+max(c(hold1, hold2, hold3), na.rm = T)
+max(c(days_aspen, days_locust, days_oak), na.rm = T)
+```
+
+
+### 8.1) Study Area Plot
+```{r study_area}
+
+
+NM_locations.sf <- read_sf(dsn = paste0(fp_data_obj, "KSU"), layer = "NM_ID_Points")
+
+NM_locations.sf <- st_transform(NM_locations.sf, proj4string = "+init=epsg:32613")
+
+NM_locations.sf$Comment <- factor(NM_locations.sf$Comment, ordered = T, 
+                           levels = c("Aspen","Locust","Oak"))
+
+
+class_colors <- c(Aspen = rgb(88,181,225, maxColorValue = 255), Locust = rgb(203,23,117, maxColorValue = 255), Oak = rgb(21,222,197, maxColorValue = 255))
+
+cols <- c("#6f1e28", "#7e3439", "#8c484b", "#9a5c5e", "#a77171", "#b48585", "#c19a9a", "#ceafaf", "#dac5c4", "#e5dbdb", 
+          "#f1f1f1", # center
+          "#dae2df", "#c4d3ce", "#aec4bd", "#98b6ac", "#83a79b", "#6d998b", "#578b7b", "#417d6c", "#286f5d", "#00614e")
+
+colnames(NM_locations.sf)[4] <- "Species"
+
+NM_locations.4326 <- st_transform(NM_locations.sf, crs = 4326)
+
+NM_bbox_4326 <- st_bbox(NM_locations.4326)
+
+scale_factor <- 1.1
+
+bb.left   <- as.numeric(NM_bbox_4326[1] - (((scale_factor - 1) * 0.5) * (NM_bbox_4326$xmax - NM_bbox_4326$xmin)))
+bb.bottom <- as.numeric(NM_bbox_4326[2] - (((scale_factor - 1) * 0.5) * (NM_bbox_4326$ymax - NM_bbox_4326$ymin)))
+bb.right  <- as.numeric(NM_bbox_4326[3] + (((scale_factor - 1) * 0.5) * (NM_bbox_4326$xmax - NM_bbox_4326$xmin)))
+bb.top    <- as.numeric(NM_bbox_4326[4] + (((scale_factor - 1) * 0.5) * (NM_bbox_4326$ymax - NM_bbox_4326$ymin))) 
+
+loc_df <- as.data.frame(st_coordinates(NM_locations.4326))
+loc_df <- cbind(loc_df, as.character(NM_locations.4326$Species))
+
+names(loc_df) <- c("longitude", "latitude", "Type")
+
+inner_bbox <- c(-106.4147, -106.371, 35.822, 35.844) # xmin, xmax, ymin, ymax
+
+
+for (i in 1:length(loc_df$Type)){
+  if (loc_df$Type[i] == "Aspen"){loc_df$Type[i] <- "A"}
+  else if (loc_df$Type[i] == "Locust"){loc_df$Type[i] <- "L"}    
+  else {loc_df$Type[i] <- "O"}  
+  }
+
+loc_df$Type <- factor(loc_df$Type, ordered = T, 
+                           levels = c("A","L","O"))
+
+
+
+osm_1 <- get_map(c(left = bb.left, bottom =bb.bottom, right = bb.right,  top = bb.top), 
+                  maptype = "terrain", 
+                  source = "osm")
+
+osm_2 <- get_map(c(left = bb.left, bottom =bb.bottom, right = bb.right,  top = bb.top), 
+                  maptype = "terrain-background", 
+                  source = "osm")
+
+center_latitude_of_plot <- (bb.bottom-bb.top)/2 + bb.top
+
+
+
+# png(file=paste0(fp_figures, "study_area", ".png"), width = 1600, height = 900, unit = "px", antialias = "cleartype")
+
+ggmap(osm_2) + coord_sf() + coord_fixed(xlim=c(bb.left, bb.right), ratio=1.35) +
+
+  geom_rect(aes(xmin= inner_bbox[1], xmax= inner_bbox[2], ymin = inner_bbox[3], ymax = inner_bbox[4]), fill = NA, color = "black", size = 1)+
+  shadowtext::geom_shadowtext(data = loc_df, aes(x = longitude, y = latitude, label = as.character(Type), color = Type), size = 8.00, inherit.aes = F)+
+  scale_color_manual(values = c("A" = rgb(88,181,225, maxColorValue = 255),
+                                "L"= rgb(203,23,117, maxColorValue = 255),
+                                "O" = rgb(21,222,197, maxColorValue = 255))) +
+  scalebar(loc_df, dist = 5, dist_unit = "km", transform = TRUE, model = "WGS84", location = "bottomleft", st.size = 8, height = 0.03, st.dist = 0.04, anchor = c(x = -106.62, y = 35.774) )+ 
+  guides(color="none") + 
+  xlab("longitude") +
+  ylab("latitude") + 
+  theme(text = element_text(size = 24)) + 
+  theme(strip.text.x = element_text(size = 24))
+
+# dev.off()
+```
+
+
+### 8.2) Marginal Probability Plots x 2
+```{r thesis_marg_plots}
+prob_curves_iter <- function(mcmc_output_name, 
+                             X_matrix, grid_length, predictors){
+
+  grid_start <- floor(min(X_matrix))
+  grid_stop <- ceiling(max(X_matrix))
+  
+  grid_values <- seq(grid_start, grid_stop, l = grid_length)
+  
+  target.beta <- paste(mcmc_output_name, "beta", sep = ".")
+  
+  eval(call("<-", "interest", as.name(target.beta)))
+  
+  n.categories <- dim(interest)[3]
+  n.predictors <- dim(X_matrix)[2]
+    
+  # cate     <- sprintf("Grp %s",seq(1:n.categories))
+  # pred     <- sprintf("X%s",seq(1:n.predictors))
+  
+  cate     <- c("Aspen", "Locust","Oak")
+  pred     <- c("Intercept", "Elevation", "Slope", "N. Exposure", "E. Exposure", "H.L. Index", "T.Pos. Index", "T.Rug. Index")
+  
+  colnames(interest) <- pred
+
+  par(mfrow = c((length(predictors) -1), n.categories), 
+      mar = c(1, 1, 1.5, 0.1),         # margin total:  Bot, Left, Top, Right 
+      oma = c(2.0, 2.2, 3.0, 0.0),         # mtext area: Bot, Left, Top, Right
+      mgp = c(1.9, 0.3,  0),               # location: axis title, labels, line
+      cex=1.5,                             # scaler
+      tcl = -0.1)                          # tick length
+   
+  r = 2
+  
+  
+  for (beta in predictors[-1]) { 
+    alpha <- sapply(1:n.categories, function(k) exp(cbind(1, grid_values) %*% t(interest[, c('Intercept', beta), k])))
+    
+    prob  <- array(alpha / rowSums(alpha), dim = c(grid_length, nrow(interest), n.categories))    
+    
+    for(k in 1:3){
+      xaxt <- yaxt <- "n"
+    
+      if (beta == predictors[length(predictors)]){ xaxt <- "s"}
+      
+      matplot(grid_values, 
+          prob[, sample(1:nrow(interest), size = 500), k], 
+          type = "l", 
+          col = scales::alpha("black", 0.06), 
+          lty = 1,
+          ylim = c(0, 1),
+          ylab = "",
+          xlab = "",
+          xaxt = xaxt,
+          yaxt = yaxt,
+          main = paste(predictors[r], "on", cate[k]))
+      
+      matlines(grid_values, 
+               t(apply(prob[, , k], 1, quantile, probs = c(0.025, 0.975))), 
+               col = 2, 
+               lty = 3, lwd = 2)
+
+      lines(grid_values,
+            apply(prob[, , k], 1, median),
+            lwd = 3)
+      
+      if (k == 1){axis(2)}
+    } # PLOT LOOP
+    r <- r + 1
+  } # BETA LOOP
+  mtext("Normalized Covariate Values",side=1,line=1,outer=TRUE,cex=2)
+  mtext("Probability of Classification",side=2,line=1,outer=TRUE,cex=2,las=0)
+  mtext("Covariate Influence on Probability of Class Membership",side=3,line=1,outer=TRUE,cex=3.0)
+} # END FUNCTION
+
+
+
+
+# png(file=paste0(fp_figures, "marginal_covariate_effects_beta", ".png"), width = 1125, height = 1150, unit = "px", antialias = "cleartype")
+
+prob_curves_iter(mcmc_output_name = "mcmc.sample", 
+                X_matrix <- model_matrix_X[1:8], 
+                grid_length = 50, 
+                predictors = c("Intercept", "Elevation", "H.L. Index", "T.Pos. Index"))
+# dev.off()
+
+
+
+# png(file=paste0(fp_figures, "appendix_additional_plots/marginal_covariate_effects_beta_app", ".png"), width = 1125, height = 1350, unit = "px", antialias = "cleartype")
+
+prob_curves_iter(mcmc_output_name = "mcmc.sample", 
+                X_matrix <- model_matrix_X[1:8], 
+                grid_length = 50, 
+                predictors = c("Intercept", "Slope", "N. Exposure", "E. Exposure", "T.Rug. Index"))
+# dev.off()
+```
+
+
+### 8.3) Event-Slice Reflectance With Uncertainty x 2
+```{r thesis_day_uncertainty}
+n_samples <- 2500
+
+event_days <- c(80, 172, 267, 356)
+
+Wavelength <- c(475, 490, 525, 560,    # 490, 560
+                575, 600, 625, 665,    # 665
+                675, 705, 725, 740,    # 705, 740
+                783, 800, 825, 842,    # 783, 842
+                865, 900, 925, 950,    # 865
+                975, 1000, 1025, 1050,
+               1075, 1100, 1125, 1150,
+               1175, 1200, 1225, 1250,
+               1275, 1300, 1325, 1350,
+               1375, 1400, 1425, 1450,
+               1475, 1500, 1525, 1550,
+               1575, 1610, 1625, 1650, # 1610
+               1675, 1700, 1725, 1750,
+               1775, 1800, 1825, 1850,
+               1875, 1900, 1925, 1950,
+               1975, 2000, 2025, 2050,
+               2075, 2100, 2125, 2150,
+               2175, 2190, 2225)       # 2190
+
+day_wave_grid <- expand.grid(day_of_year = event_days, Wavelength = Wavelength)
+
+G_pred <- Predict.matrix(object = G_obj, data = day_wave_grid)
+
+sample_surfaces <- array(
+  sapply(sample(1:nrow(mcmc.sample), n_samples), function(iter){expit(G_pred %*% mcmc.sample.gamma[iter, , ])}),
+  dim = c(length(event_days),length(Wavelength), 3, n_samples))
+
+array_dim_names <- list(c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice"),
+                   as.character(Wavelength),
+                   c("Aspen", "Locust", "Oak"))
+
+lower_bounds <-  array(NA, dim = c(length(event_days), length(Wavelength), 3), dimnames = array_dim_names)
+upper_bounds <-  array(NA, dim = c(length(event_days), length(Wavelength), 3), dimnames = array_dim_names)
+median_line  <-  array(NA, dim = c(length(event_days), length(Wavelength), 3), dimnames = array_dim_names)
+
+
+for (day in 1:length(event_days)){ 
+  for (wav in 1:length(Wavelength)){ 
+    for (grp in 1:3){ 
+      lower_bounds[day,wav,grp] <- quantile(sample_surfaces[day,wav,grp, ], 0.025)
+      upper_bounds[day,wav,grp] <- quantile(sample_surfaces[day,wav,grp, ], 0.975)
+      median_line[day,wav,grp]  <- median(sample_surfaces[day,wav,grp, ]) 
+      }}}
+
+lower_bounds_a <- as.data.frame(lower_bounds[,,1]) 
+lower_bounds_l <- as.data.frame(lower_bounds[,,2])
+lower_bounds_o <- as.data.frame(lower_bounds[,,3])
+ 
+lower_bounds_a$Event <- lower_bounds_l$Event <- lower_bounds_o$Event <- c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice")
+
+lower_bounds_a$Species <- "Aspen"
+lower_bounds_l$Species <- "Locust"
+lower_bounds_o$Species <- "Oak"
+
+lb_reshape_a <- reshape::melt(lower_bounds_a, id = c("Event", "Species"))
+lb_reshape_l <- reshape::melt(lower_bounds_l, id = c("Event", "Species"))
+lb_reshape_o <- reshape::melt(lower_bounds_o, id = c("Event", "Species"))
+
+lb_reshape_a$Bound <- lb_reshape_l$Bound <- lb_reshape_o$Bound <- "0.025"
+lb_reshape_a$Median <- lb_reshape_l$Median <- lb_reshape_o$Median <- NA
+
+upper_bounds_a <- as.data.frame(upper_bounds[,,1]) 
+upper_bounds_l <- as.data.frame(upper_bounds[,,2])
+upper_bounds_o <- as.data.frame(upper_bounds[,,3])
+
+upper_bounds_a$Event <- upper_bounds_l$Event <- upper_bounds_o$Event <- c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice")
+
+upper_bounds_a$Species <- "Aspen"
+upper_bounds_l$Species <- "Locust"
+upper_bounds_o$Species <- "Oak"
+
+ub_reshape_a <- reshape::melt(upper_bounds_a, id = c("Event", "Species"))
+ub_reshape_l <- reshape::melt(upper_bounds_l, id = c("Event", "Species"))
+ub_reshape_o <- reshape::melt(upper_bounds_o, id = c("Event", "Species"))
+
+ub_reshape_a$Bound <- ub_reshape_l$Bound <- ub_reshape_o$Bound <- "0.975"
+ub_reshape_a$Median <- ub_reshape_l$Median <- ub_reshape_o$Median <- NA
+
+median_line_a <- as.data.frame(median_line[,,1]) 
+median_line_l <- as.data.frame(median_line[,,2])
+median_line_o <- as.data.frame(median_line[,,3])
+
+median_line_a$Event <- median_line_l$Event <- median_line_o$Event <-c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice")
+
+median_line_a$Species <- "Aspen"
+median_line_l$Species <- "Locust"
+median_line_o$Species <- "Oak"
+
+med_reshape_a <- reshape::melt(median_line_a, id = c("Event", "Species"))
+med_reshape_l <- reshape::melt(median_line_l, id = c("Event", "Species"))
+med_reshape_o <- reshape::melt(median_line_o, id = c("Event", "Species"))
+
+med_reshape_a$Bound <- med_reshape_l$Bound <- med_reshape_o$Bound <- NA
+med_reshape_a$Median <- med_reshape_l$Median <- med_reshape_o$Median <- "Median"
+
+bounds_df <- rbind(lb_reshape_a, lb_reshape_l, lb_reshape_o, ub_reshape_a,ub_reshape_l,ub_reshape_o, med_reshape_a, med_reshape_l, med_reshape_o)
+
+names(bounds_df) <-  c("Event", "Species", "Wavelength", "Reflectance", "Bound", "Median")
+
+bounds_df$Wavelength <- as.numeric(as.character(bounds_df$Wavelength))
+
+bounds_df$Event <- factor(bounds_df$Event, ordered = T, 
+                           levels = c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice"))
+
+bounds_df$Species <- factor(bounds_df$Species, ordered = T, 
+                           levels = c("Aspen","Locust","Oak"))
+
+bounds_df$Bound <- as.character(bounds_df$Bound)
+
+bounds_df$Bound <- factor(bounds_df$Bound, ordered = T, 
+                           levels = c("0.025","0.975"))
+
+bounds_df$Median <- factor(bounds_df$Median, levels = c("Median"))
+
+
+
+# png(file=paste0(fp_figures, "appendix_additional_plots/reflectance_surface_day_slice_uncertainty_app", ".png"), width = 1125, height = 690, unit = "px", antialias = "cleartype")
+bounds_df_in <- bounds_df[bounds_df$Event %in% c("Spring Equinox","Autumnal Equinox"), ]
+
+hold <- bounds_df_in[which(!is.na(bounds_df_in$Bound)), ]
+ribbon_lb <- hold[which(hold$Bound == "0.025"), ]
+ribbon_ub <- hold[which(hold$Bound == "0.975"), ]
+
+ribbon_lb <- ribbon_lb[1:4]
+ribbon_ub <- ribbon_ub[1:4]
+
+names(ribbon_lb) <- c("Event", "Species", "Wavelength", "lb")
+names(ribbon_ub) <- c("Event", "Species", "Wavelength", "ub")
+
+ribbon <- left_join(ribbon_lb, ribbon_ub, by = c("Event", "Species", "Wavelength"))
+
+ggplot(data = bounds_df_in, aes(Wavelength, Reflectance)) +
+  geom_vline(xintercept = sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)], color = "darkgray") + 
+  geom_ribbon(data = ribbon, aes(x = Wavelength, ymin = lb, ymax = ub), fill = "red", alpha = 0.20, inherit.aes = F) + 
+  geom_line(data = bounds_df_in[which(bounds_df_in$Median == "Median"), ], aes(Wavelength, Reflectance, color = Species), size = 1, inherit.aes = F) + 
+  labs(title= "True Reflectance By Seasonal Event With Uncertainty", 
+       y = "reflectance", 
+       x = "wavelength") + 
+  scale_color_manual(values = c("Aspen" = rgb(88,181,225, maxColorValue = 255),
+                                "Locust"= rgb(203,23,117, maxColorValue = 255),
+                                "Oak" = rgb(21,222,197, maxColorValue = 255))) +
+  facet_nested_wrap(~Event + Species, axes = "all", remove_labels = "all", nrow = 4, ncol = 3) + 
+  ggthemes::theme_calc() + 
+  theme(text = element_text(size = 24),
+        panel.spacing = unit(.1, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, size = 2), 
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        strip.background = element_rect(color = "black", size = 2),
+        plot.background = element_rect(color = NA),
+        legend.position = "none", 
+        axis.line=element_line())
+
+# dev.off()
+
+
+
+# png(file=paste0(fp_figures, "reflectance_surface_day_slice_uncertainty", ".png"), width = 1125, height = 690, unit = "px", antialias = "cleartype")
+
+bounds_df_out <- bounds_df[bounds_df$Event %in% c("Summer Solstice", "Winter Solstice"), ]
+
+hold <- bounds_df_out[which(!is.na(bounds_df_out$Bound)), ]
+ribbon_lb <- hold[which(hold$Bound == "0.025"), ]
+ribbon_ub <- hold[which(hold$Bound == "0.975"), ]
+
+ribbon_lb <- ribbon_lb[1:4]
+ribbon_ub <- ribbon_ub[1:4]
+
+names(ribbon_lb) <- c("Event", "Species", "Wavelength", "lb")
+names(ribbon_ub) <- c("Event", "Species", "Wavelength", "ub")
+
+ribbon <- left_join(ribbon_lb, ribbon_ub, by = c("Event", "Species", "Wavelength"))
+
+ggplot(data = bounds_df_out, aes(Wavelength, Reflectance)) +
+  geom_vline(xintercept = sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)], color = "darkgray") + 
+  geom_ribbon(data = ribbon, aes(x = Wavelength, ymin = lb, ymax = ub), fill = "red", alpha = 0.20, inherit.aes = F) + 
+  geom_line(data = bounds_df_out[which(bounds_df_out$Median == "Median"), ], aes(Wavelength, Reflectance, color = Species), size = 1, inherit.aes = F) + 
+  labs(title= "True Reflectance By Seasonal Event With Uncertainty", 
+       y = "reflectance", 
+       x = "wavelength") + 
+  scale_color_manual(values = c("Aspen" = rgb(88,181,225, maxColorValue = 255),
+                                "Locust"= rgb(203,23,117, maxColorValue = 255),
+                                "Oak" = rgb(21,222,197, maxColorValue = 255))) +
+  facet_nested_wrap(~Event + Species, axes = "all", remove_labels = "all", nrow = 4, ncol = 3) + 
+  ggthemes::theme_calc() + 
+  theme(text = element_text(size = 24),
+        panel.spacing = unit(.1, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, size = 2), 
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        strip.background = element_rect(color = "black", size = 2),
+        plot.background = element_rect(color = NA),
+        legend.position = "none", 
+        axis.line=element_line())
+
+# dev.off()
+
+```
+### 8.4) Event-Slice Comp Reflectance x 2
+```{r thesis_day_comp}
+day_of_year <- c(80, 172, 267, 356)
+
+Wavelength <- c(475, 490, 525, 560,    # 490, 560
+                575, 600, 625, 665,    # 665
+                675, 705, 725, 740,    # 705, 740
+                783, 800, 825, 842,    # 783, 842
+                865, 900, 925, 950,    # 865
+                975, 1000, 1025, 1050,
+               1075, 1100, 1125, 1150,
+               1175, 1200, 1225, 1250,
+               1275, 1300, 1325, 1350,
+               1375, 1400, 1425, 1450,
+               1475, 1500, 1525, 1550,
+               1575, 1610, 1625, 1650, # 1610
+               1675, 1700, 1725, 1750,
+               1775, 1800, 1825, 1850,
+               1875, 1900, 1925, 1950,
+               1975, 2000, 2025, 2050,
+               2075, 2100, 2125, 2150,
+               2175, 2190, 2225)       # 2190
+
+# Wavelength <- sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)]
+
+day_wave_grid <- expand.grid(day_of_year = day_of_year, Wavelength = Wavelength)
+
+day_wave_interpol <- Predict.matrix(object = G_obj, data = day_wave_grid) %*% posterior_params$gamma
+
+day_wave_interpol.grp1 <- matrix(expit(day_wave_interpol[, 1]), length(day_of_year), length(Wavelength))
+day_wave_interpol.grp2 <- matrix(expit(day_wave_interpol[, 2]), length(day_of_year), length(Wavelength))
+day_wave_interpol.grp3 <- matrix(expit(day_wave_interpol[, 3]), length(day_of_year), length(Wavelength))
+
+day_wave_interpol.grp1 <- as.data.frame(t(day_wave_interpol.grp1))
+day_wave_interpol.grp2 <- as.data.frame(t(day_wave_interpol.grp2))
+day_wave_interpol.grp3 <- as.data.frame(t(day_wave_interpol.grp3))
+
+names(day_wave_interpol.grp1) <- names(day_wave_interpol.grp2) <- names(day_wave_interpol.grp3) <- c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice")
+
+day_wave_interpol.grp1$Wavelength <- day_wave_interpol.grp2$Wavelength <- day_wave_interpol.grp3$Wavelength <- Wavelength
+
+day_wave_interpol.grp1$Species <- "Aspen"
+day_wave_interpol.grp2$Species <- "Locust"
+day_wave_interpol.grp3$Species <- "Oak"
+
+day_wave_interpol.all <- rbind(day_wave_interpol.grp1, day_wave_interpol.grp2, day_wave_interpol.grp3)
+
+day_wave_interpol.all <- reshape::melt(day_wave_interpol.all, id = c("Wavelength", "Species"))
+
+names(day_wave_interpol.all) <- c("Wavelength", "Species", "Event", "Reflectance")
+
+day_wave_interpol.all$Species <- factor(day_wave_interpol.all$Species, ordered = T, 
+                           levels = c("Aspen","Locust","Oak"))
+
+day_wave_interpol.all$Event <- factor(day_wave_interpol.all$Event, 
+                           levels = c("Spring Equinox", "Summer Solstice", "Autumnal Equinox", "Winter Solstice"))
+
+day_wave_interpol.equinox <- day_wave_interpol.all[day_wave_interpol.all$Event %in% c("Summer Solstice","Winter Solstice"), ]
+
+
+
+# png(file=paste0(fp_figures, "reflectance_surface_day_slice", ".png"), width = 1125, height = 520, unit = "px", antialias = "cleartype")
+
+ggplot(data = day_wave_interpol.equinox, aes(Wavelength, Reflectance, color = Species)) +
+  geom_vline(xintercept = sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)], color = "darkgray") +
+  geom_line(size = 1) + 
+  labs(title= "True Reflectance By Seasonal Event", 
+       y = "reflectance", 
+       x = "wavelength") + 
+   scale_color_manual(values = c("Aspen" = rgb(88,181,225, maxColorValue = 255),
+                                "Locust"= rgb(203,23,117, maxColorValue = 255),
+                                "Oak" = rgb(21,222,197, maxColorValue = 255))) +
+  facet_wrap(~Event) + 
+  ggthemes::theme_calc() + 
+  theme(text = element_text(size = 24),
+        panel.border = element_rect(color = "black", fill = NA, size = 2), 
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        strip.background = element_rect(color = "black", size = 2),
+        plot.background = element_rect(color = NA),
+        axis.line=element_line())
+
+# dev.off()
+
+
+
+day_wave_interpol.solstice <- day_wave_interpol.all[day_wave_interpol.all$Event %in% c("Spring Equinox", "Autumnal Equinox"), ]
+
+# png(file=paste0(fp_figures, "appendix_additional_plots/reflectance_surface_day_slice_app", ".png"), width = 1125, height = 520, unit = "px", antialias = "cleartype")
+
+ggplot(data = day_wave_interpol.solstice, aes(Wavelength, Reflectance, color = Species)) +
+  geom_vline(xintercept = sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)], color = "darkgray") +
+  geom_line(size = 1) + 
+  labs(title= "True Reflectance By Seasonal Event", 
+       y = "reflectance", 
+       x = "wavelength") + 
+   scale_color_manual(values = c("Aspen" = rgb(88,181,225, maxColorValue = 255),
+                                "Locust"= rgb(203,23,117, maxColorValue = 255),
+                                "Oak" = rgb(21,222,197, maxColorValue = 255))) +
+  facet_wrap(~Event) + 
+  ggthemes::theme_calc() + 
+  theme(text = element_text(size = 24),
+        panel.border = element_rect(color = "black", fill = NA, size = 2), 
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        strip.background = element_rect(color = "black", size = 2),
+        plot.background = element_rect(color = NA),
+        axis.line=element_line())
+
+# dev.off()
+
+```
+
+### 8.5) Reflectance Surface x 3
+```{r thesis_reflectance_surfaces}
+n_days <- 52
+
+n_bands <- length(unique(agg_band_data$Wavelength))
+
+day_of_year = seq(1, 365, length.out = n_days) 
+
+# Wavelength = sort(unique(agg_band_data$Wavelength)) ## use observed wavelengths
+
+Wavelength <- c(475, 490, 525, 560,    # 490, 560
+                575, 600, 625, 665,    # 665
+                675, 705, 725, 740,    # 705, 740
+                783, 800, 825, 842,    # 783, 842
+                865, 900, 925, 950,    # 865
+                975, 1000, 1025, 1050,
+               1075, 1100, 1125, 1150,
+               1175, 1200, 1225, 1250,
+               1275, 1300, 1325, 1350,
+               1375, 1400, 1425, 1450,
+               1475, 1500, 1525, 1550,
+               1575, 1610, 1625, 1650, # 1610
+               1675, 1700, 1725, 1750,
+               1775, 1800, 1825, 1850,
+               1875, 1900, 1925, 1950,
+               1975, 2000, 2025, 2050,
+               2075, 2100, 2125, 2150,
+               2175, 2190, 2225)       # 2190
+
+Bands <- unique(agg_band_data$Band)[order(unique(agg_band_data$Wavelength))]
+
+reflect_grid <- expand.grid(day_of_year = day_of_year, Wavelength = Wavelength)
+
+reflect_interpol <- expit(Predict.matrix(object = G_obj, data = reflect_grid) %*% posterior_params$gamma)
+
+reflect_interpol.list <- list()
+
+for (i in 1:3){ 
+  reflect_interpol.list[[i]] <- matrix(reflect_interpol[, i], length(day_of_year), length(Wavelength))
+} 
+
+max_reflectance <- max(unlist(lapply(reflect_interpol.list,FUN=max)))
+min_reflectance <- min(unlist(lapply(reflect_interpol.list,FUN=min)))
+
+names(reflect_interpol.list) <- c("Aspen", "Locust", "Oak")
+
+
+
+# png(file=paste0(fp_figures, "reflectance_surface_aspen", ".png"), width = 540, height = 405, unit = "px", antialias = "cleartype")
+
+par(mar = c(3, 0, 2.5, 0),       
+    cex=1.5,                             
+    tcl = -0.1, 
+    mgp = c(1.8, 0.3,  0),
+    oma = c(0, 4.1, 0, 2))
+
+
+filled.contour(day_of_year, 
+               Wavelength, 
+               reflect_interpol.list[[1]], 
+               plot.title = title(main = "Aspen True Reflectance", 
+               xlab = "Day of year", 
+               ylab = "",
+               cex.main=1.9, 
+               cex.lab=1.5),
+               zlim=range(unlist(reflect_interpol.list)),
+               plot.axes = {axis(1); axis(2); 
+              lines(c(1,365), c(490, 490), col = "darkgray");
+              lines(c(1,365), c(560, 560), col = "darkgray");
+              lines(c(1,365), c(665, 665), col = "darkgray");
+              lines(c(1,365), c(705, 705), col = "darkgray");
+              lines(c(1,365), c(740, 740), col = "darkgray");
+              lines(c(1,365), c(783, 783), col = "darkgray");
+              lines(c(1,365), c(842, 842), col = "darkgray");
+              lines(c(1,365), c(865, 865), col = "darkgray");
+              lines(c(1,365), c(1610, 1610), col = "darkgray");
+              lines(c(1,365), c(2190, 2190), col = "darkgray")})
+mtext("Central wavelength",side=2,line=2.4,outer=TRUE,cex=1.5,las=0)
+
+# dev.off()
+
+
+
+# png(file=paste0(fp_figures, "reflectance_surface_locust", ".png"), width = 540, height = 405, unit = "px", antialias = "cleartype")
+
+par(mar = c(3, 0, 2.5, 0),       
+    cex=1.5,                             
+    tcl = -0.1, 
+    mgp = c(1.8, 0.3,  0),
+    oma = c(0, 4.1, 0, 2))
+
+filled.contour(day_of_year, 
+               Wavelength, 
+               reflect_interpol.list[[2]], 
+               plot.title = title(main = "Locust True Reflectance", 
+               xlab = "Day of year", 
+               ylab = "",
+               cex.main=1.9, 
+               cex.lab=1.5),
+               zlim=range(unlist(reflect_interpol.list)),
+               plot.axes = {axis(1); axis(2); 
+              lines(c(1,365), c(490, 490), col = "darkgray");
+              lines(c(1,365), c(560, 560), col = "darkgray");
+              lines(c(1,365), c(665, 665), col = "darkgray");
+              lines(c(1,365), c(705, 705), col = "darkgray");
+              lines(c(1,365), c(740, 740), col = "darkgray");
+              lines(c(1,365), c(783, 783), col = "darkgray");
+              lines(c(1,365), c(842, 842), col = "darkgray");
+              lines(c(1,365), c(865, 865), col = "darkgray");
+              lines(c(1,365), c(1610, 1610), col = "darkgray");
+              lines(c(1,365), c(2190, 2190), col = "darkgray")})
+mtext("Central wavelength",side=2,line=2.4,outer=TRUE,cex=1.5,las=0)
+
+# dev.off()
+
+
+
+# png(file=paste0(fp_figures, "reflectance_surface_oak", ".png"), width = 540, height = 405, unit = "px", antialias = "cleartype")
+
+par(mar = c(3, 0, 2.5, 0),       
+    cex=1.5,                             
+    tcl = -0.1, 
+    mgp = c(1.8, 0.3,  0),
+    oma = c(0, 4.1, 0, 2))
+
+filled.contour(day_of_year, 
+               Wavelength, 
+               reflect_interpol.list[[3]], 
+               plot.title = title(main = "Oak True Reflectance", 
+               xlab = "Day of year", 
+               ylab = "",
+               cex.main=1.9, 
+               cex.lab=1.5),
+               zlim=range(unlist(reflect_interpol.list)),
+               plot.axes = {axis(1); axis(2); 
+              lines(c(1,365), c(490, 490), col = "darkgray");
+              lines(c(1,365), c(560, 560), col = "darkgray");
+              lines(c(1,365), c(665, 665), col = "darkgray");
+              lines(c(1,365), c(705, 705), col = "darkgray");
+              lines(c(1,365), c(740, 740), col = "darkgray");
+              lines(c(1,365), c(783, 783), col = "darkgray");
+              lines(c(1,365), c(842, 842), col = "darkgray");
+              lines(c(1,365), c(865, 865), col = "darkgray");
+              lines(c(1,365), c(1610, 1610), col = "darkgray");
+              lines(c(1,365), c(2190, 2190), col = "darkgray")})
+mtext("Central wavelength",side=2,line=2.4,outer=TRUE,cex=1.5,las=0)
+
+# dev.off()
+```
+
+### 8.6) Spatial Surface x 3
+```{r thesis_spatial_surfaces_1}
+NM_locations.4326 <- st_transform(NM_locations.sf, crs = 4326)
+
+
+NM_bbox_4326 <- st_bbox(NM_locations.4326, ext = 1.1)
+
+scale_factor <- 1.1
+
+bb.left   <- as.numeric(NM_bbox_4326[1] - (((scale_factor - 1) * 0.5) * (NM_bbox_4326$xmax - NM_bbox_4326$xmin)))
+bb.bottom <- as.numeric(NM_bbox_4326[2] - (((scale_factor - 1) * 0.5) * (NM_bbox_4326$ymax - NM_bbox_4326$ymin)))
+bb.right  <- as.numeric(NM_bbox_4326[3] + (((scale_factor - 1) * 0.5) * (NM_bbox_4326$xmax - NM_bbox_4326$xmin)))
+bb.top    <- as.numeric(NM_bbox_4326[4] + (((scale_factor - 1) * 0.5) * (NM_bbox_4326$ymax - NM_bbox_4326$ymin))) 
+
+loc_df <- as.data.frame(st_coordinates(NM_locations.4326))
+loc_df <- cbind(loc_df, as.character(NM_locations.4326$Species))
+
+names(loc_df) <- c("longitude", "latitude", "Type")
+for (i in 1:length(loc_df$Type)){
+  if (loc_df$Type[i] == "Aspen"){loc_df$Type[i] <- "A"}
+  else if (loc_df$Type[i] == "Locust"){loc_df$Type[i] <- "L"}    
+  else {loc_df$Type[i] <- "O"}  
+  }
+
+loc_df$Type <- factor(loc_df$Type, ordered = T, 
+                           levels = c("A","L","O"))
+
+
+# X_max  <- max(loc_df$longitude)
+# X_min  <- min(loc_df$longitude)
+# Y_max  <- max(loc_df$latitude)
+# Y_min  <- min(loc_df$latitude)
+# 
+# X_max  <- max(study_area_poly[[1]][[1]][,1])
+# X_min  <- min(study_area_poly[[1]][[1]][,1])
+# Y_max  <- max(study_area_poly[[1]][[1]][,2])
+# Y_min  <- min(study_area_poly[[1]][[1]][,2])
+# 
+# X_max  <- -106.28
+# X_min  <- -106.63
+# Y_max  <- 35.91
+# Y_min  <- 35.75
+
+X_max  <- bb.right
+X_min  <- bb.left
+Y_max  <- bb.top
+Y_min  <- bb.bottom
+
+long_grid <- seq(X_min, X_max, length.out = 125)
+lat_grid  <- seq(Y_min, Y_max, length.out = 125)
+
+spat_grid <- expand.grid(X = long_grid, Y = lat_grid)
+
+spat_interpol <- Predict.matrix(object = H_obj, data = spat_grid) %*% posterior_params$phi
+
+
+spat_interpol.list <- list()
+
+for (i in 1:3){ 
+spat_interpol.list[[i]] <- matrix(spat_interpol[, i], 125, 125)
+} 
+
+names(spat_interpol.list) <- c("Aspen", "Locust", "Oak")
+
+scale_min <- -max(abs(range(unlist(spat_interpol.list))))
+scale_max <-  max(abs(range(unlist(spat_interpol.list))))
+
+spat_interpol_long <- cbind(spat_grid, spat_interpol)
+
+names(spat_interpol_long) <- c("longitude", "latitude", "Aspen", "Locust", "Oak")
+
+spat_interpol_long <- reshape2::melt(spat_interpol_long,id.vars=c("longitude", "latitude"))
+spat_interpol_sf   <- st_as_sf(spat_interpol_long, coords = c("longitude", "latitude"), crs = 4326)
+
+
+# png(file=paste0(fp_figures, "spatial_process_aspen", ".png"), width = 1600, height = 900, unit = "px", antialias = "cleartype")
+
+ggplot(study_area_poly) + coord_sf(default_crs = sf::st_crs(4326), expand = F) +
+  geom_contour_filled(data = spat_interpol_long[spat_interpol_long$variable == "Aspen",], 
+                      aes(x = longitude, y = latitude, z = value), 
+                      breaks=c(rev(-0.23 * c(1:10)),-0.04 , 0.04, 0.23 * c(1:10))) + 
+  scale_fill_manual(values = cols, drop = FALSE) +
+  geom_rect(aes(xmin= -106.4147, xmax= -106.371, ymin = 35.822, ymax = 35.844), fill = NA, color = "black", size = 1)+
+  shadowtext::geom_shadowtext(data = loc_df, aes(x = longitude, y = latitude, label = as.character(Type), color = Type), size = 8.00, inherit.aes = F)+
+  scale_color_manual(values = c("A" = rgb(88,181,225, maxColorValue = 255),
+                                "L"= rgb(203,23,117, maxColorValue = 255),
+                                "O" = rgb(21,222,197, maxColorValue = 255))) +
+  scalebar(loc_df, dist = 5, dist_unit = "km", transform = TRUE, model = "WGS84", location = "bottomleft", st.size = 8, height = 0.03, st.dist = 0.04, anchor = c(x = -106.62, y = 35.774) )+ 
+  guides(fill=guide_legend(ncol=1, reverse = T, override.aes = list(size = 10))) + 
+  guides(color="none") + 
+  labs(fill = "Spatial effect") + 
+  theme(text = element_text(size = 24)) + 
+  theme(strip.text.x = element_text(size = 24))
+
+# dev.off()
+
+
+
+# png(file=paste0(fp_figures, "spatial_process_locust", ".png"), width = 1600, height = 900, unit = "px", antialias = "cleartype")
+
+ggplot(study_area_poly) + coord_sf(default_crs = sf::st_crs(4326)) +
+  geom_contour_filled(data = spat_interpol_long[spat_interpol_long$variable == "Locust",], 
+                      aes(x = longitude, y = latitude, z = value), 
+                      breaks=c(rev(-0.23 * c(1:10)),-0.04 , 0.04, 0.23 * c(1:10))) + 
+  scale_fill_manual(values = cols, drop = FALSE) +
+  geom_rect(aes(xmin= -106.4147, xmax= -106.371, ymin = 35.822, ymax = 35.844), fill = NA, color = "black", size = 1)+
+  shadowtext::geom_shadowtext(data = loc_df, aes(x = longitude, y = latitude, label = as.character(Type), color = Type), size = 8.00, inherit.aes = F)+
+  scale_color_manual(values = c("A" = rgb(88,181,225, maxColorValue = 255),
+                                "L"= rgb(203,23,117, maxColorValue = 255),
+                                "O" = rgb(21,222,197, maxColorValue = 255))) +
+  scalebar(loc_df, dist = 5, dist_unit = "km", transform = TRUE, model = "WGS84", location = "bottomleft", st.size = 8, height = 0.03, st.dist = 0.04, anchor = c(x = -106.62, y = 35.774) )+ 
+  guides(fill=guide_legend(ncol=1, reverse = T, override.aes = list(size = 10))) + 
+  guides(color="none") + 
+  labs(fill = "Spatial effect") + 
+  theme(text = element_text(size = 24)) + 
+  theme(strip.text.x = element_text(size = 24))
+
+# dev.off()
+
+
+
+# png(file=paste0(fp_figures, "spatial_process_oak", ".png"), width = 1600, height = 900, unit = "px", antialias = "cleartype")
+
+ggplot(study_area_poly) + coord_sf(default_crs = sf::st_crs(4326)) +
+  geom_contour_filled(data = spat_interpol_long[spat_interpol_long$variable == "Oak",], 
+                      aes(x = longitude, y = latitude, z = value), 
+                      breaks=c(rev(-0.23 * c(1:10)),-0.04 , 0.04, 0.23 * c(1:10))) + 
+  scale_fill_manual(values = cols, drop = FALSE) +
+  geom_rect(aes(xmin= -106.4147, xmax= -106.371, ymin = 35.822, ymax = 35.844), fill = NA, color = "black", size = 1)+
+  shadowtext::geom_shadowtext(data = loc_df, aes(x = longitude, y = latitude, label = as.character(Type), color = Type), size = 8.00, inherit.aes = F)+
+  scale_color_manual(values = c("A" = rgb(88,181,225, maxColorValue = 255),
+                                "L"= rgb(203,23,117, maxColorValue = 255),
+                                "O" = rgb(21,222,197, maxColorValue = 255))) +
+  scalebar(loc_df, dist = 5, dist_unit = "km", transform = TRUE, model = "WGS84", location = "bottomleft", st.size = 8, height = 0.03, st.dist = 0.04, anchor = c(x = -106.62, y = 35.774) ) + 
+  guides(fill=guide_legend(ncol=1, reverse = T, override.aes = list(size = 10))) + 
+  guides(color="none") + 
+  labs(fill = "Spatial effect") + 
+  theme(text = element_text(size = 24)) + 
+  theme(strip.text.x = element_text(size = 24))
+
+# dev.off()
+```
+
+### 8.7) Spatial Surface ZOOM x 3
+```{r thesis_spatial_surfaces_zoom}
+X_max  <- -106.371
+X_min  <- -106.4147
+Y_max  <- 35.844
+Y_min  <- 35.822
+
+long_grid <- seq(X_min, X_max, length.out = 125)
+lat_grid  <- seq(Y_min, Y_max, length.out = 125)
+
+spat_grid <- expand.grid(X = long_grid, Y = lat_grid)
+
+spat_interpol <- Predict.matrix(object = H_obj, data = spat_grid) %*% posterior_params$phi
+
+
+spat_interpol_long <- cbind(spat_grid, spat_interpol)
+
+names(spat_interpol_long) <- c("longitude", "latitude", "Aspen", "Locust", "Oak")
+
+spat_interpol_long <- reshape2::melt(spat_interpol_long,id.vars=c("longitude", "latitude"))
+
+spat_aspen_long  <- spat_interpol_long[spat_interpol_long$variable == "Aspen",c(1,2,4)]
+spat_locust_long <- spat_interpol_long[spat_interpol_long$variable == "Locust",c(1,2,4)]
+spat_oak_long    <- spat_interpol_long[spat_interpol_long$variable == "Oak",c(1,2,4)]
+
+
+
+
+loc_df <- NM_locations.df[NM_locations.df$X < -106.371 & NM_locations.df$X > -106.4147 & NM_locations.df$Y <  35.844 & NM_locations.df$Y > 35.822, c("X", "Y", "Type")]
+
+names(loc_df) <- c("longitude", "latitude", "Type")
+
+for (i in 1:length(loc_df$Type)){
+  if (loc_df$Type[i] == 1){loc_df$Type[i] <- "A"}
+  else if (loc_df$Type[i] == 2){loc_df$Type[i] <- "L"}    
+  else {loc_df$Type[i] <- "O"}  
+  }
+
+loc_df$Type <- factor(loc_df$Type, ordered = T, 
+                           levels = c("A","L","O"))
+
+cols <- c("#6f1e28", "#7e3439", "#8c484b", "#9a5c5e", "#a77171", "#b48585", "#c19a9a", "#ceafaf", "#dac5c4", "#e5dbdb",
+"#f1f1f1", 
+"#dae2df",
+"#c4d3ce",
+"#aec4bd",
+"#98b6ac",
+"#83a79b",
+"#6d998b",
+"#578b7b",
+"#417d6c",
+"#286f5d",
+"#00614e")
+
+colpal <- colorRampPalette(rev(cols))
+
+
+
+# png(file=paste0(fp_figures, "zoom_spat_process_aspen", ".png"), width = 1458, height = 900, unit = "px", antialias = "cleartype")
+
+ggplot(study_area_poly) + coord_sf(default_crs = sf::st_crs(4326)) +
+  geom_contour_filled(data = spat_interpol_long[spat_interpol_long$variable == "Aspen",], 
+                      aes(x = longitude, y = latitude, z = value), 
+                      breaks=c(rev(-0.23 * c(1:10)),-0.04 , 0.04, 0.23 * c(1:10))) + 
+  scale_fill_manual(values = cols, drop = FALSE) +
+  shadowtext::geom_shadowtext(data = loc_df, aes(x = longitude, y = latitude, label = as.character(Type), color = Type), size = 8.00, inherit.aes = F)+
+  scale_color_manual(values = c("A" = rgb(88,181,225, maxColorValue = 255),
+                                "L"= rgb(203,23,117, maxColorValue = 255),
+                                "O" = rgb(21,222,197, maxColorValue = 255))) +
+    scalebar(loc_df, dist = 500, dist_unit = "m", transform = TRUE, model = "WGS84", location = "bottomleft", st.size = 8, height = 0.03, st.dist = 0.04, anchor = c(x = -106.4125, y = 35.8235) )+ 
+  guides(fill=guide_legend(ncol=1, reverse = T, override.aes = list(size = 10))) + 
+  guides(color="none") + 
+  labs(fill = "Spatial effect") + 
+  theme(text = element_text(size = 24)) + 
+  theme(strip.text.x = element_text(size = 24))
+
+# dev.off()
+
+
+
+# png(file=paste0(fp_figures, "zoom_spat_process_locust", ".png"), width = 1458, height = 900, unit = "px", antialias = "cleartype")
+
+ggplot(study_area_poly) + coord_sf(default_crs = sf::st_crs(4326)) +
+  geom_contour_filled(data = spat_interpol_long[spat_interpol_long$variable == "Locust",], 
+                      aes(x = longitude, y = latitude, z = value), 
+                      breaks=c(rev(-0.23 * c(1:10)),-0.04 , 0.04, 0.23 * c(1:10))) + 
+  scale_fill_manual(values = cols, drop = FALSE) +
+  shadowtext::geom_shadowtext(data = loc_df, aes(x = longitude, y = latitude, label = as.character(Type), color = Type), size = 8.00, inherit.aes = F)+
+  scale_color_manual(values = c("A" = rgb(88,181,225, maxColorValue = 255),
+                                "L"= rgb(203,23,117, maxColorValue = 255),
+                                "O" = rgb(21,222,197, maxColorValue = 255))) +
+    scalebar(loc_df, dist = 500, dist_unit = "m", transform = TRUE, model = "WGS84", location = "bottomleft", st.size = 8, height = 0.03, st.dist = 0.04, anchor = c(x = -106.4125, y = 35.8235) )+ 
+  guides(fill=guide_legend(ncol=1, reverse = T, override.aes = list(size = 10))) + 
+  guides(color="none") + 
+  labs(fill = "Spatial effect") + 
+  theme(text = element_text(size = 24)) + 
+  theme(strip.text.x = element_text(size = 24))
+
+# dev.off()
+
+
+
+# png(file=paste0(fp_figures, "zoom_spat_process_oak", ".png"), width = 1458, height = 900, unit = "px", antialias = "cleartype")
+
+ggplot(study_area_poly) + coord_sf(default_crs = sf::st_crs(4326)) +
+  geom_contour_filled(data = spat_interpol_long[spat_interpol_long$variable == "Oak",], 
+                      aes(x = longitude, y = latitude, z = value), 
+                      breaks=c(rev(-0.23 * c(1:10)),-0.04 , 0.04, 0.23 * c(1:10))) + 
+  scale_fill_manual(values = cols, drop = FALSE) +
+  shadowtext::geom_shadowtext(data = loc_df, aes(x = longitude, y = latitude, label = as.character(Type), color = Type), size = 8.00, inherit.aes = F)+
+  scale_color_manual(values = c("A" = rgb(88,181,225, maxColorValue = 255),
+                                "L"= rgb(203,23,117, maxColorValue = 255),
+                                "O" = rgb(21,222,197, maxColorValue = 255))) +
+    scalebar(loc_df, dist = 500, dist_unit = "m", transform = TRUE, model = "WGS84", location = "bottomleft", st.size = 8, height = 0.03, st.dist = 0.04, anchor = c(x = -106.4125, y = 35.8235) )+ 
+  guides(fill=guide_legend(ncol=1, reverse = T, override.aes = list(size = 10))) + 
+  guides(color="none") + 
+  labs(fill = "Spatial effect") + 
+  theme(text = element_text(size = 24)) + 
+  theme(strip.text.x = element_text(size = 24))
+
+# dev.off()
+
+
+```
+
+### 8.8) Reflectance By Band
+```{r reflectance_plots_band}
+band_grid <- expand.grid(day_of_year = seq(1, 365, length.out = 52), Wavelength =  sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)])
+
+band_interpol <- Predict.matrix(object = G_obj, data = band_grid) %*% posterior_params$gamma
+
+band_interpol.grp1 <- matrix(expit(band_interpol[, 1]), 52, 10)
+band_interpol.grp2 <- matrix(expit(band_interpol[, 2]), 52, 10)
+band_interpol.grp3 <- matrix(expit(band_interpol[, 3]), 52, 10)
+
+lambdas    <- sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)]
+band_names <-  c("2", "3", "4", "5", "6", "7", "8", "8A", "11", "12")
+
+times <- seq(1, 365, length.out = 52)
+
+## I WANT TO OVERLAY EACH REFLECTANCE BAND WITH THE ACTUAL DAYS OF MEASUREMENT.
+# UNIQUE MEASUREMENT DAYS PER GROUP 
+grp1.obs_days <- unique(agg_band_data[which(agg_band_data$Type == 1), "day_of_year"])
+grp2.obs_days <- unique(agg_band_data[which(agg_band_data$Type == 2), "day_of_year"])
+grp3.obs_days <- unique(agg_band_data[which(agg_band_data$Type == 3), "day_of_year"])
+
+# NEED TO PREDICT THESE VALUES ON ACTUAL DAYS OF MEASUREMENT
+grp1.obs_grid <- expand.grid(day_of_year = grp1.obs_days, Wavelength =  sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)])
+grp2.obs_grid <- expand.grid(day_of_year = grp2.obs_days, Wavelength =  sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)])
+grp3.obs_grid <- expand.grid(day_of_year = grp3.obs_days, Wavelength =  sent2_bands$WAVELENGTH_nm[c(2,3,4,5,6,7,8,9,12,13)])
+
+# PREDICTING NEEDED VALUES
+grp1.obs_vals <- Predict.matrix(object = G_obj, data = grp1.obs_grid) %*% posterior_params$gamma
+grp2.obs_vals <- Predict.matrix(object = G_obj, data = grp2.obs_grid) %*% posterior_params$gamma
+grp3.obs_vals <- Predict.matrix(object = G_obj, data = grp3.obs_grid) %*% posterior_params$gamma
+
+# LINK FUNCTION FOR OBSERVED REFLECTANCE
+grp1.obs_vals <- matrix(expit(grp1.obs_vals[, 1]), length(grp1.obs_days), 10)
+grp2.obs_vals <- matrix(expit(grp2.obs_vals[, 2]), length(grp2.obs_days), 10)
+grp3.obs_vals <- matrix(expit(grp3.obs_vals[, 3]), length(grp3.obs_days), 10)
+
+# MEASUREMENT DAYS AND BANDS BY PREDICTED REFLECTANCE
+grp1.obs <- as.data.frame(cbind(grp1.obs_days, grp1.obs_vals))
+grp2.obs <- as.data.frame(cbind(grp2.obs_days, grp2.obs_vals))
+grp3.obs <- as.data.frame(cbind(grp3.obs_days, grp3.obs_vals))
+
+# GRID DAYS AND BANDS BY PREDICTED REFLECTANCE FOR TOTAL SURFACE EST.
+grp1.grid_vals <- as.data.frame(cbind(times, band_interpol.grp1))
+grp2.grid_vals <- as.data.frame(cbind(times, band_interpol.grp2))
+grp3.grid_vals <- as.data.frame(cbind(times, band_interpol.grp3))
+
+names(grp1.obs) <- c("day_of_year", band_names)
+names(grp2.obs) <- c("day_of_year", band_names)
+names(grp3.obs) <- c("day_of_year", band_names)
+names(grp1.grid_vals) <- c("day_of_year", band_names)
+names(grp2.grid_vals) <- c("day_of_year", band_names)
+names(grp3.grid_vals) <- c("day_of_year", band_names)
+
+# RESHAPE FOR GGPLOT
+bands.grp1.grid <- reshape::melt(grp1.grid_vals, id = "day_of_year")
+bands.grp2.grid <- reshape::melt(grp2.grid_vals, id = "day_of_year")
+bands.grp3.grid <- reshape::melt(grp3.grid_vals, id = "day_of_year")
+
+predicted.values.list <- list(bands.grp1.grid$value, bands.grp2.grid$value, bands.grp3.grid$value)
+
+pred_range_min <- round_any(min(range(unlist(predicted.values.list))),0.0005, floor)
+
+pred_range_max <- round_any(max(range(unlist(predicted.values.list))),0.0005, ceiling)
+
+bands.grp1.grid$Species <- "Aspen"
+bands.grp2.grid$Species <- "Locust"
+bands.grp3.grid$Species <- "Oak"
+
+bands.allgrps.grid <- rbind(bands.grp1.grid, bands.grp2.grid, bands.grp3.grid)
+
+
+
+# png(file=paste0(fp_figures, "reflectance_surface_band_slice", ".png"),  width = 1125, height = 800, unit = "px", antialias = "cleartype")
+bands.allgrps.grid.in <- bands.allgrps.grid[bands.allgrps.grid$variable %in% c("4","5", "8", "12"), ]
+
+band.labs <- c("Band 4 (Red)", "Band 5 (Red-Edge 1)", "Band 8 (NIR)", "Band 12 (SWIR2)")
+names(band.labs) <-  c("4", "5", "8", "12")
+
+ggplot(data = bands.allgrps.grid.in, aes(day_of_year, value, color = Species)) +
+  geom_vline(xintercept = c(80, 172, 267, 356), color = "darkgray") + 
+  geom_line(size = 1.0) + 
+  labs(title= "True Reflectance By Selected Sentinel-2 Band", 
+       y = "reflectance", 
+       x = "day of year") + 
+  scale_y_continuous(limits = c(pred_range_min, pred_range_max)) + 
+  scale_color_manual(values = c("Aspen" = rgb(88,181,225, maxColorValue = 255),
+                                "Locust"= rgb(203,23,117, maxColorValue = 255),
+                                "Oak" = rgb(21,222,197, maxColorValue = 255)))+ 
+  facet_wrap(~variable, ncol = 2, labeller = labeller(variable = band.labs)) + 
+  ggthemes::theme_calc() + 
+  theme(text = element_text(size = 24),
+        panel.border = element_rect(color = "black", fill = NA, size = 2), 
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        strip.background = element_rect(color = "black", size = 2),
+        plot.background = element_rect(color = NA),
+        axis.line=element_line())
+
+# dev.off()
+
+
+
+# png(file=paste0(fp_figures, "appendix_additional_plots/reflectance_surface_band_slice_app", ".png"),  width = 1125, height = 1150, unit = "px", antialias = "cleartype")
+bands.allgrps.grid.out <- bands.allgrps.grid[bands.allgrps.grid$variable %in% c("2", "3","6", "7","8A", "11"), ]
+
+band.labs <- c("Band 2 (Blue)", "Band 3 (Green)", "Band 6 (Red-Edge 2)","Band 7 (Red-Edge 3)", "Band 8A (NIR-narrow)", "Band 11 (SWIR3)")
+names(band.labs) <-  c("2", "3","6", "7","8A", "11")
+
+ggplot(data = bands.allgrps.grid.out, aes(day_of_year, value, color = Species)) +
+  geom_vline(xintercept = c(80, 172, 267, 356), color = "darkgray") + 
+  geom_line(size = 1.0) + 
+  labs(title= "True Reflectance By Selected Sentinel-2 Band", 
+       y = "reflectance", 
+       x = "day of year") + 
+  scale_y_continuous(limits = c(pred_range_min, pred_range_max)) + 
+  scale_color_manual(values = c("Aspen" = rgb(88,181,225, maxColorValue = 255),
+                                "Locust"= rgb(203,23,117, maxColorValue = 255),
+                                "Oak" = rgb(21,222,197, maxColorValue = 255)))+ 
+  facet_wrap(~variable, ncol = 2, labeller = labeller(variable = band.labs)) + 
+  ggthemes::theme_calc() + 
+  theme(text = element_text(size = 24),
+        panel.border = element_rect(color = "black", fill = NA, size = 2), 
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        strip.background = element_rect(color = "black", size = 2),
+        plot.background = element_rect(color = NA),
+        axis.line=element_line())
+
+# dev.off()
+```
